@@ -6,6 +6,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.GlobalNamespace;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.mem.Memory;
 import ghidra.program.model.symbol.*;
 import ghidra.program.model.symbol.ReferenceManager;
 import ghidra.program.model.symbol.Reference;
@@ -339,6 +340,13 @@ public class GhidraMCPPlugin extends Plugin {
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
+        });
+
+        server.createContext("/interrupts", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, listInterrupts(offset, limit));
         });
 
         server.setExecutor(null);
@@ -1525,6 +1533,1485 @@ public class GhidraMCPPlugin extends Plugin {
             }
         }
         return null;
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Interrupt Analysis Methods
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * List all interrupts found through comprehensive analysis
+     */
+    private String listInterrupts(int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+
+        try {
+            List<InterruptInfo> interrupts = analyzeInterrupts(program);
+            
+            // Apply pagination
+            List<String> formattedResults = new ArrayList<>();
+            for (InterruptInfo interrupt : interrupts) {
+                formattedResults.add(formatInterruptInfo(interrupt));
+            }
+            
+            return paginateList(formattedResults, offset, limit);
+        } catch (Exception e) {
+            return "Error analyzing interrupts: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Comprehensive interrupt analysis combining multiple techniques
+     */
+    private List<InterruptInfo> analyzeInterrupts(Program program) {
+        Map<Integer, InterruptInfo> interruptMap = new HashMap<>();
+        
+        // 1. Analyze vector table (primary source)
+        analyzeVectorTable(program, interruptMap);
+        
+        // 2. Analyze NVIC register operations
+        analyzeNVICOperations(program, interruptMap);
+        
+        // 3. Identify interrupt handler functions
+        identifyInterruptHandlers(program, interruptMap);
+        
+        // 4. Analyze GhidraSVD comments for interrupt information
+        analyzeGhidraSVDComments(program, interruptMap);
+        
+        // 5. Analyze peripheral register configurations
+        analyzePeripheralInterruptConfig(program, interruptMap);
+        
+        // 6. Filter to only include actually configured interrupts
+        List<InterruptInfo> interrupts = filterActiveInterrupts(interruptMap);
+        interrupts.sort((a, b) -> Integer.compare(a.irqNumber, b.irqNumber));
+        
+        return interrupts;
+    }
+
+    /**
+     * Analyze the ARM Cortex-M vector table starting at address 0x00000000
+     */
+    private void analyzeVectorTable(Program program, Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            Address vectorTableBase = program.getAddressFactory().getAddress("0x00000000");
+            Memory memory = program.getMemory();
+            
+            // ARM Cortex-M system exception vectors
+            Map<Integer, String> systemVectors = new HashMap<>();
+            systemVectors.put(0x04, "Reset");
+            systemVectors.put(0x08, "NMI");
+            systemVectors.put(0x0C, "HardFault");
+            systemVectors.put(0x10, "MemManage");
+            systemVectors.put(0x14, "BusFault");
+            systemVectors.put(0x18, "UsageFault");
+            systemVectors.put(0x2C, "SVCall");
+            systemVectors.put(0x38, "PendSV");
+            systemVectors.put(0x3C, "SysTick");
+            
+            // Read system exception vectors
+            for (Map.Entry<Integer, String> entry : systemVectors.entrySet()) {
+                int offset = entry.getKey();
+                String name = entry.getValue();
+                
+                Address vectorAddr = vectorTableBase.add(offset);
+                if (memory.contains(vectorAddr)) {
+                    try {
+                        long handlerAddr = memory.getInt(vectorAddr) & 0xFFFFFFFEL; // Clear thumb bit
+                        if (handlerAddr != 0) {
+                            int irqNumber = getSystemExceptionNumber(name);
+                            InterruptInfo info = interruptMap.computeIfAbsent(irqNumber, 
+                                k -> new InterruptInfo(k, name, "system_exception"));
+                            info.handlerAddress = handlerAddr;
+                            info.vectorTableOffset = offset;
+                        }
+                    } catch (Exception e) {
+                        // Skip invalid addresses
+                    }
+                }
+            }
+            
+            // Read external interrupt vectors (starting at 0x40)
+            int irqOffset = 0x40;
+            int irqNum = 0;
+            int consecutiveZeros = 0;
+            
+            while (irqNum < 150) { // Reasonable limit for ARM Cortex-M4
+                Address vectorAddr = vectorTableBase.add(irqOffset);
+                if (!memory.contains(vectorAddr)) {
+                    break;
+                }
+                
+                try {
+                    long handlerAddr = memory.getInt(vectorAddr) & 0xFFFFFFFEL; // Clear thumb bit
+                    if (handlerAddr == 0) {
+                        consecutiveZeros++;
+                        if (consecutiveZeros > 10) {
+                            // Likely reached end of valid vector table
+                            break;
+                        }
+                        irqOffset += 4;
+                        irqNum++;
+                        continue;
+                    }
+                    
+                    consecutiveZeros = 0; // Reset counter
+                    
+                    // Validate handler address is within reasonable code range
+                    if (isValidCodeAddress(program, handlerAddr)) {
+                        String irqName = "IRQ_" + irqNum;
+                        InterruptInfo info = interruptMap.computeIfAbsent(irqNum, 
+                            k -> new InterruptInfo(k, irqName, "external_irq"));
+                        info.handlerAddress = handlerAddr;
+                        info.vectorTableOffset = irqOffset;
+                    }
+                    
+                } catch (Exception e) {
+                    // Skip invalid addresses
+                }
+                
+                irqOffset += 4;
+                irqNum++;
+            }
+            
+        } catch (Exception e) {
+            Msg.error(this, "Error analyzing vector table: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Analyze NVIC register operations to find interrupt configurations
+     */
+    private void analyzeNVICOperations(Program program, Map<Integer, InterruptInfo> interruptMap) {
+        // NVIC register addresses for ARM Cortex-M
+        Map<String, Long> nvicRegisters = new HashMap<>();
+        nvicRegisters.put("ISER0", 0xE000E100L); // Interrupt Set Enable Register 0
+        nvicRegisters.put("ISER1", 0xE000E104L); // Interrupt Set Enable Register 1
+        nvicRegisters.put("ISER2", 0xE000E108L); // Interrupt Set Enable Register 2
+        nvicRegisters.put("ISER3", 0xE000E10CL); // Interrupt Set Enable Register 3
+        nvicRegisters.put("ICER0", 0xE000E180L); // Interrupt Clear Enable Register 0
+        nvicRegisters.put("ICER1", 0xE000E184L); // Interrupt Clear Enable Register 1
+        nvicRegisters.put("ICER2", 0xE000E188L); // Interrupt Clear Enable Register 2
+        nvicRegisters.put("ICER3", 0xE000E18CL); // Interrupt Clear Enable Register 3
+        
+        ReferenceManager refManager = program.getReferenceManager();
+        
+        for (Map.Entry<String, Long> entry : nvicRegisters.entrySet()) {
+            String regName = entry.getKey();
+            Long regAddr = entry.getValue();
+            
+            try {
+                Address nvicAddr = program.getAddressFactory().getAddress(String.format("0x%08X", regAddr));
+                ReferenceIterator refs = refManager.getReferencesTo(nvicAddr);
+                
+                while (refs.hasNext()) {
+                    Reference ref = refs.next();
+                    if (ref.getReferenceType().isWrite()) {
+                        analyzeNVICWrite(program, ref, regName, regAddr, interruptMap);
+                    }
+                }
+            } catch (Exception e) {
+                // Skip invalid addresses
+            }
+        }
+    }
+
+    /**
+     * Analyze a specific NVIC register write operation
+     */
+    private void analyzeNVICWrite(Program program, Reference ref, String regName, long nvicAddr, 
+                                 Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            Address fromAddr = ref.getFromAddress();
+            Instruction instruction = program.getListing().getInstructionAt(fromAddr);
+            
+            if (instruction != null) {
+                // Try to extract immediate value from the instruction
+                Long immediateValue = extractImmediateValue(instruction);
+                if (immediateValue != null) {
+                    // Determine register index (0-3 for different 32-bit chunks)
+                    int registerIndex = getRegisterIndex(regName);
+                    
+                    // Decode which IRQ bits are set
+                    for (int bit = 0; bit < 32; bit++) {
+                        if ((immediateValue & (1L << bit)) != 0) {
+                            int irqNum = registerIndex * 32 + bit;
+                            
+                            InterruptInfo info = interruptMap.computeIfAbsent(irqNum, 
+                                k -> new InterruptInfo(k, "IRQ_" + k, "external_irq"));
+                            
+                            // Record NVIC operation
+                            info.nvicOperations.add(new NVICOperation(regName, fromAddr.getOffset(), immediateValue));
+                            
+                            if (regName.startsWith("ISER")) {
+                                info.enabled = true;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Skip invalid instructions
+        }
+    }
+
+    /**
+     * Identify interrupt handler functions by analyzing calling patterns
+     */
+    private void identifyInterruptHandlers(Program program, Map<Integer, InterruptInfo> interruptMap) {
+        FunctionManager funcManager = program.getFunctionManager();
+        
+        // Check if any known handler addresses correspond to actual functions
+        for (InterruptInfo interrupt : interruptMap.values()) {
+            if (interrupt.handlerAddress != 0) {
+                try {
+                    Address handlerAddr = program.getAddressFactory().getAddress(String.format("0x%08X", interrupt.handlerAddress));
+                    Function handler = funcManager.getFunctionAt(handlerAddr);
+                    
+                    if (handler != null) {
+                        interrupt.handlerFunctionName = handler.getName();
+                        interrupt.isHandlerFunction = true;
+                    } else {
+                        // Check if there's a function containing this address
+                        Function containingFunc = funcManager.getFunctionContaining(handlerAddr);
+                        if (containingFunc != null) {
+                            interrupt.handlerFunctionName = containingFunc.getName() + "+offset";
+                            interrupt.isHandlerFunction = true;
+                        }
+                    }
+                } catch (Exception e) {
+                    // Skip invalid addresses
+                }
+            }
+        }
+    }
+
+    /**
+     * Format interrupt information for display
+     */
+    private String formatInterruptInfo(InterruptInfo interrupt) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("IRQ %d: %s", interrupt.irqNumber, interrupt.name));
+        sb.append(String.format(" [%s]", interrupt.type));
+        
+        // Add confidence and reason
+        if (!"unknown".equals(interrupt.confidence)) {
+            sb.append(String.format(" {%s:%s}", interrupt.confidence.toUpperCase(), interrupt.reason));
+        }
+        
+        if (interrupt.handlerAddress != 0) {
+            sb.append(String.format(" -> 0x%08X", interrupt.handlerAddress));
+            if (interrupt.handlerFunctionName != null) {
+                sb.append(" (").append(interrupt.handlerFunctionName).append(")");
+            }
+        }
+        
+        if (interrupt.vectorTableOffset != -1) {
+            sb.append(String.format(" VT:0x%02X", interrupt.vectorTableOffset));
+        }
+        
+        // Add peripheral information with register details
+        if (interrupt.peripheralName != null) {
+            sb.append(String.format(" %s", interrupt.peripheralName));
+            if (interrupt.registerName != null) {
+                sb.append(String.format(".%s", interrupt.registerName));
+            }
+            if (interrupt.interruptSource != null) {
+                sb.append(String.format("(%s)", interrupt.interruptSource));
+            }
+        }
+        
+        // Add SVD description if available
+        if (interrupt.svdDescription != null && !interrupt.svdDescription.isEmpty()) {
+            sb.append(String.format(" \"%s\"", interrupt.svdDescription));
+        }
+        
+        // Add trigger type if detected
+        if (interrupt.triggerType != null) {
+            sb.append(String.format(" [%s]", interrupt.triggerType));
+        }
+        
+        // Add configured value
+        if (interrupt.configuredValue != null) {
+            sb.append(String.format(" Value:%s", interrupt.configuredValue));
+        }
+        
+        // Add bit field configuration (shortened)
+        if (interrupt.bitFieldConfig != null && !interrupt.bitFieldConfig.isEmpty()) {
+            String shortBitFields = interrupt.bitFieldConfig.length() > 50 
+                ? interrupt.bitFieldConfig.substring(0, 47) + "..." 
+                : interrupt.bitFieldConfig;
+            sb.append(String.format(" Fields:{%s}", shortBitFields));
+        }
+        
+        if (interrupt.enabled) {
+            sb.append(" [ENABLED]");
+        }
+        
+        if (!interrupt.nvicOperations.isEmpty()) {
+            sb.append(" NVIC:");
+            for (NVICOperation op : interrupt.nvicOperations) {
+                sb.append(String.format(" %s@0x%08X", op.operation, op.address));
+            }
+        }
+        
+        // Add configuration addresses if available
+        if (interrupt.hasPeripheralConfig) {
+            sb.append(String.format(" Cfg:0x%08X", interrupt.peripheralConfigAddress));
+        }
+        
+        return sb.toString();
+    }
+
+    /**
+     * Helper method to extract immediate values from instructions
+     */
+    private Long extractImmediateValue(Instruction instruction) {
+        try {
+            // Check each operand for immediate values
+            for (int i = 0; i < instruction.getNumOperands(); i++) {
+                Object[] opObjects = instruction.getOpObjects(i);
+                for (Object obj : opObjects) {
+                    if (obj instanceof Number) {
+                        return ((Number) obj).longValue();
+                    }
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Get system exception number for ARM Cortex-M
+     */
+    private int getSystemExceptionNumber(String name) {
+        switch (name) {
+            case "Reset": return -3;
+            case "NMI": return -2;
+            case "HardFault": return -1;
+            case "MemManage": return -12;
+            case "BusFault": return -11;
+            case "UsageFault": return -10;
+            case "SVCall": return -5;
+            case "PendSV": return -2;
+            case "SysTick": return -1;
+            default: return 0;
+        }
+    }
+
+    /**
+     * Get register index from NVIC register name
+     */
+    private int getRegisterIndex(String regName) {
+        if (regName.endsWith("0")) return 0;
+        if (regName.endsWith("1")) return 1;
+        if (regName.endsWith("2")) return 2;
+        if (regName.endsWith("3")) return 3;
+        return 0;
+    }
+
+    /**
+     * Analyze GhidraSVD comments using peripheral-centric approach
+     */
+    private void analyzeGhidraSVDComments(Program program, Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            // Step 1: Collect all SVD comments grouped by peripheral
+            Map<String, List<SVDComment>> peripheralComments = collectSVDCommentsByPeripheral(program);
+            
+            // Step 2: For each peripheral, find the best interrupt configuration
+            for (Map.Entry<String, List<SVDComment>> entry : peripheralComments.entrySet()) {
+                String peripheralName = entry.getKey();
+                List<SVDComment> comments = entry.getValue();
+                
+                // Find the best interrupt configuration for this peripheral
+                SVDComment bestConfig = findBestInterruptConfiguration(comments);
+                if (bestConfig != null) {
+                    // Map this peripheral to its IRQ and update interrupt info
+                    updateInterruptInfoFromBestConfig(peripheralName, bestConfig, interruptMap);
+                }
+            }
+            
+        } catch (Exception e) {
+            Msg.error(this, "Error analyzing GhidraSVD comments: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Collect all SVD comments grouped by peripheral name
+     */
+    private Map<String, List<SVDComment>> collectSVDCommentsByPeripheral(Program program) {
+        Map<String, List<SVDComment>> peripheralComments = new HashMap<>();
+        Listing listing = program.getListing();
+        
+        // Search through all memory blocks for SVD comments
+        for (MemoryBlock block : program.getMemory().getBlocks()) {
+            collectCommentsFromBlock(listing, block, peripheralComments);
+        }
+        
+        return peripheralComments;
+    }
+
+    /**
+     * Collect SVD comments from a specific memory block
+     */
+    private void collectCommentsFromBlock(Listing listing, MemoryBlock block, 
+                                        Map<String, List<SVDComment>> peripheralComments) {
+        try {
+            Address start = block.getStart();
+            Address end = block.getEnd();
+            
+            // Check data comments
+            DataIterator dataIter = listing.getDefinedData(start, true);
+            while (dataIter.hasNext()) {
+                Data data = dataIter.next();
+                if (data.getAddress().compareTo(end) > 0) break;
+                
+                collectCommentsFromAddress(listing, data.getAddress(), peripheralComments);
+            }
+            
+            // Check instruction comments
+            InstructionIterator instrIter = listing.getInstructions(start, true);
+            while (instrIter.hasNext()) {
+                Instruction instr = instrIter.next();
+                if (instr.getAddress().compareTo(end) > 0) break;
+                
+                collectCommentsFromAddress(listing, instr.getAddress(), peripheralComments);
+            }
+            
+        } catch (Exception e) {
+            // Skip problematic blocks
+        }
+    }
+
+    /**
+     * Collect all SVD comments from a specific address
+     */
+    private void collectCommentsFromAddress(Listing listing, Address address, 
+                                          Map<String, List<SVDComment>> peripheralComments) {
+        for (int commentType : new int[]{CodeUnit.PLATE_COMMENT, CodeUnit.PRE_COMMENT, 
+                                        CodeUnit.POST_COMMENT, CodeUnit.EOL_COMMENT}) {
+            String comment = listing.getComment(commentType, address);
+            if (comment != null && comment.startsWith("SVD:")) {
+                SVDComment svdComment = parseSVDCommentStructure(comment, address);
+                if (svdComment != null) {
+                    peripheralComments.computeIfAbsent(svdComment.peripheralName, k -> new ArrayList<>()).add(svdComment);
+                }
+            }
+        }
+    }
+
+    /**
+     * Find the best interrupt configuration from a list of peripheral comments
+     */
+    private SVDComment findBestInterruptConfiguration(List<SVDComment> comments) {
+        if (comments.isEmpty()) {
+            return null;
+        }
+        
+        // Sort comments by priority (best interrupt config first)
+        comments.sort((a, b) -> {
+            int priorityA = getInterruptConfigPriority(a);
+            int priorityB = getInterruptConfigPriority(b);
+            return Integer.compare(priorityB, priorityA); // Higher priority first
+        });
+        
+        // Return the highest priority comment that has interrupt relevance
+        for (SVDComment comment : comments) {
+            if (getInterruptConfigPriority(comment) > 0) {
+                return comment;
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Get priority score for interrupt configuration (higher = better)
+     */
+    private int getInterruptConfigPriority(SVDComment comment) {
+        String regName = comment.registerName.toUpperCase();
+        
+        // Priority 1: Explicit interrupt enable registers (highest priority)
+        if (regName.matches(".*(INTENSET|INTENCLR|INTEN|IER|IMR|IMASK).*")) {
+            // Extra points if it has actual interrupt source details in bit fields
+            if (hasSpecificInterruptSources(comment)) {
+                return 100;
+            }
+            return 90;
+        }
+        
+        // Priority 2: Configuration registers with interrupt details
+        if (regName.matches(".*(CONFIG|CFG).*") && hasSpecificInterruptSources(comment)) {
+            return 80;
+        }
+        
+        // Priority 3: Control registers with interrupt-related fields
+        if (regName.matches(".*(CTRL|CTRLA|CTRLB).*") && hasInterruptRelatedFields(comment)) {
+            return 60;
+        }
+        
+        // Priority 4: Event control registers
+        if (regName.matches(".*(EVCTRL|EVACT).*")) {
+            return 50;
+        }
+        
+        // Priority 5: Status/flag registers (lower priority)
+        if (regName.matches(".*(STATUS|INTFLAG|FLAG).*")) {
+            return 30;
+        }
+        
+        // No interrupt relevance
+        return 0;
+    }
+
+    /**
+     * Check if comment has specific interrupt sources (SENSE7, CH3, EXTINT15, etc.)
+     */
+    private boolean hasSpecificInterruptSources(SVDComment comment) {
+        String content = comment.fullComment.toUpperCase();
+        
+        // Look for numbered interrupt sources
+        return content.matches(".*(SENSE\\d+|CH\\d+|EXTINT\\d+|INT\\d+|OC\\d+|CC\\d+|IC\\d+).*") ||
+               content.matches(".*(OVF|COMPA|COMPB|CAPT|ERROR|READY|DONE).*");
+    }
+
+    /**
+     * Check if comment has interrupt-related fields (even if not specific sources)
+     */
+    private boolean hasInterruptRelatedFields(SVDComment comment) {
+        String content = comment.fullComment.toUpperCase();
+        return content.contains("INTERRUPT") || content.contains("INTEN") || 
+               content.contains("ENABLE") || content.contains("IE") ||
+               content.contains("MASK") || content.contains("FLAG");
+    }
+
+    /**
+     * Update interrupt info from the best configuration found for a peripheral
+     */
+    private void updateInterruptInfoFromBestConfig(String peripheralName, SVDComment bestConfig, 
+                                                 Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            // Get IRQ mapping for this peripheral
+            int irqNum = mapPeripheralToIRQ(peripheralName, bestConfig.registerName);
+            
+            if (irqNum >= 0) {
+                // Generate interrupt name with specific source if possible
+                String interruptName = generateInterruptName(peripheralName, bestConfig.registerName, bestConfig.fullComment);
+                InterruptInfo info = interruptMap.computeIfAbsent(irqNum, 
+                    k -> new InterruptInfo(k, interruptName, "external_irq"));
+                
+                // Update with best configuration details
+                info.name = interruptName;
+                info.peripheralName = peripheralName;
+                info.registerName = bestConfig.registerName;
+                info.hasPeripheralConfig = true;
+                info.peripheralConfigAddress = bestConfig.address.getOffset();
+                info.svdDescription = bestConfig.description;
+                info.configuredValue = bestConfig.configuredValue;
+                
+                // Parse bit field information from the best config
+                parseBitFields(bestConfig.fullComment, info);
+                
+                // Mark this as a high-confidence peripheral config
+                if (info.confidence.equals("unknown")) {
+                    info.confidence = "high";
+                    info.reason = "best_peripheral_config";
+                }
+            }
+            
+        } catch (Exception e) {
+            // Skip problematic configurations
+        }
+    }
+
+    /**
+     * Extract interrupt information from GhidraSVD comments
+     */
+    private void extractInterruptInfoFromComment(String comment, Address address, 
+                                               Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            // Parse structured SVD comments (format: "SVD: PERIPHERAL.REGISTER - Description")
+            if (comment.startsWith("SVD:")) {
+                parseSVDComment(comment, address, interruptMap);
+                return;
+            }
+            
+            String lowerComment = comment.toLowerCase();
+            
+            // Look for interrupt enable patterns in regular comments
+            if (lowerComment.contains("interrupt") && (lowerComment.contains("enable") || 
+                lowerComment.contains("intenset") || lowerComment.contains("inten"))) {
+                
+                // Extract peripheral and interrupt names from the comment
+                String peripheralName = extractPeripheralName(comment);
+                String interruptName = extractInterruptName(comment);
+                
+                if (peripheralName != null && interruptName != null) {
+                    // Try to map to IRQ number using known mappings
+                    int irqNum = mapPeripheralToIRQ(peripheralName, interruptName);
+                    if (irqNum >= 0) {
+                        InterruptInfo info = interruptMap.computeIfAbsent(irqNum, 
+                            k -> new InterruptInfo(k, peripheralName + "_" + interruptName, "external_irq"));
+                        info.hasPeripheralConfig = true;
+                        info.peripheralConfigAddress = address.getOffset();
+                        info.peripheralName = peripheralName;
+                        info.interruptSource = interruptName;
+                    }
+                }
+            }
+            
+            // Look for NVIC register names in comments
+            if (lowerComment.contains("nvic") || lowerComment.contains("iser") || 
+                lowerComment.contains("icer") || lowerComment.contains("interrupt")) {
+                
+                // Extract IRQ numbers from comments like "IRQ11", "External Interrupt 11", etc.
+                String irqNumber = extractIRQNumberFromComment(comment);
+                if (irqNumber != null) {
+                    try {
+                        int irqNum = Integer.parseInt(irqNumber);
+                        if (irqNum >= 0 && irqNum < 150) { // Validate reasonable range
+                            InterruptInfo info = interruptMap.computeIfAbsent(irqNum, 
+                                k -> new InterruptInfo(k, "IRQ_" + k, "external_irq"));
+                            info.hasCommentInfo = true;
+                            info.commentInfoAddress = address.getOffset();
+                        }
+                    } catch (NumberFormatException e) {
+                        // Skip invalid numbers
+                    }
+                }
+            }
+            
+        } catch (Exception e) {
+            // Skip problematic comments
+        }
+    }
+
+    /**
+     * Parse structured SVD comments to extract detailed interrupt information
+     */
+    private void parseSVDComment(String comment, Address address, Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            // Example: "SVD: EIC.CONFIG1 - External Interrupt Controller; External Interrupt Sense Configuration [32-bit] {SENSE7:RISE - Rising edge detection (0x1)} <== 0x10000000"
+            
+            // Extract peripheral name from "SVD: PERIPHERAL.REGISTER"
+            String[] parts = comment.split(" - ", 2);
+            if (parts.length < 2) return;
+            
+            String regPart = parts[0].trim();
+            if (!regPart.startsWith("SVD:")) return;
+            
+            String regInfo = regPart.substring(4).trim(); // Remove "SVD:"
+            String[] regComponents = regInfo.split("\\.", 2);
+            if (regComponents.length < 2) return;
+            
+            String peripheralName = regComponents[0].trim();
+            String registerName = regComponents[1].trim();
+            
+            // Extract the value written to the register from "<== VALUE" pattern
+            String writtenValue = extractWrittenValueFromComment(comment);
+            
+            // Check if this is an interrupt-related register
+            if (isInterruptRegister(registerName)) {
+                // Get IRQ mapping for this peripheral
+                int irqNum = mapPeripheralToIRQ(peripheralName, registerName);
+                
+                if (irqNum >= 0) {
+                    // Create or update interrupt info
+                    String interruptName = generateInterruptName(peripheralName, registerName, comment);
+                    InterruptInfo info = interruptMap.computeIfAbsent(irqNum, 
+                        k -> new InterruptInfo(k, interruptName, "external_irq"));
+                    
+                    // Update with SVD details
+                    info.peripheralName = peripheralName;
+                    info.registerName = registerName;
+                    info.hasPeripheralConfig = true;
+                    info.peripheralConfigAddress = address.getOffset();
+                    info.svdDescription = extractDescription(parts[1]);
+                    info.configuredValue = writtenValue;
+                    
+                    // Parse bit field information
+                    parseBitFields(comment, info);
+                } else {
+                    // Store peripheral config for later correlation
+                    storePeripheralConfig(peripheralName, registerName, address, writtenValue, comment, interruptMap);
+                }
+            }
+            
+        } catch (Exception e) {
+            // Skip problematic SVD comments
+        }
+    }
+
+    /**
+     * Check if register name indicates interrupt functionality
+     */
+    private boolean isInterruptRegister(String registerName) {
+        String lowerName = registerName.toLowerCase();
+        return lowerName.contains("inten") || lowerName.contains("intenset") || 
+               lowerName.contains("intenclr") || lowerName.contains("config") ||
+               lowerName.contains("ctrl") || lowerName.contains("evctrl");
+    }
+
+    /**
+     * Generate a descriptive interrupt name from SVD information
+     */
+    private String generateInterruptName(String peripheral, String register, String comment) {
+        // Try to extract specific interrupt source from bit fields
+        String specificSource = extractSpecificInterruptSource(comment);
+        if (specificSource != null) {
+            return peripheral + "_" + specificSource;
+        }
+        
+        // Fallback to peripheral + register
+        return peripheral + "_" + register;
+    }
+
+    /**
+     * Extract specific interrupt source from bit field information using generic patterns
+     */
+    private String extractSpecificInterruptSource(String comment) {
+        String configuredValue = extractWrittenValueFromComment(comment);
+        
+        // Strategy 1: Look for enabled fields with non-zero values in bit field config
+        List<String> enabledSources = findEnabledInterruptSources(comment, configuredValue);
+        if (!enabledSources.isEmpty()) {
+            // Return the most specific source found
+            return selectBestInterruptSource(enabledSources);
+        }
+        
+        // Strategy 2: Generic pattern matching for interrupt source names
+        return findInterruptSourceByPattern(comment);
+    }
+
+    /**
+     * Find interrupt sources that are enabled (have non-zero values) in the bit fields
+     */
+    private List<String> findEnabledInterruptSources(String comment, String configuredValue) {
+        List<String> enabledSources = new ArrayList<>();
+        
+        if (configuredValue == null) {
+            return enabledSources;
+        }
+        
+        try {
+            // Parse the configured value
+            long value = parseHexOrDecimal(configuredValue);
+            if (value == 0) {
+                return enabledSources;
+            }
+            
+            // Extract bit field configurations from {...} pattern
+            java.util.regex.Pattern bitFieldPattern = java.util.regex.Pattern.compile("\\{([^}]+)\\}");
+            java.util.regex.Matcher matcher = bitFieldPattern.matcher(comment);
+            
+            while (matcher.find()) {
+                String bitFields = matcher.group(1);
+                enabledSources.addAll(analyzeEnabledBitFields(bitFields, value));
+            }
+            
+        } catch (Exception e) {
+            // Fall back to pattern matching if value parsing fails
+        }
+        
+        return enabledSources;
+    }
+
+    /**
+     * Analyze bit fields to find which interrupt sources are enabled
+     */
+    private List<String> analyzeEnabledBitFields(String bitFields, long configuredValue) {
+        List<String> enabledSources = new ArrayList<>();
+        
+        // Parse individual bit field entries: "FIELDNAME:Description (0xVALUE)"
+        java.util.regex.Pattern fieldPattern = java.util.regex.Pattern.compile("(\\w+\\d*):[^(]*\\(0x([0-9A-Fa-f]+)\\)");
+        java.util.regex.Matcher matcher = fieldPattern.matcher(bitFields);
+        
+        while (matcher.find()) {
+            String fieldName = matcher.group(1);
+            String fieldValueStr = matcher.group(2);
+            
+            try {
+                long fieldValue = Long.parseUnsignedLong(fieldValueStr, 16);
+                
+                // If this field has a non-zero value, it might be an enabled interrupt source
+                if (fieldValue > 0) {
+                    String interruptSource = mapFieldToInterruptSource(fieldName, fieldValue);
+                    if (interruptSource != null) {
+                        enabledSources.add(interruptSource);
+                    }
+                }
+            } catch (NumberFormatException e) {
+                // Skip invalid field values
+            }
+        }
+        
+        return enabledSources;
+    }
+
+    /**
+     * Map a bit field name to an interrupt source using generic patterns
+     */
+    private String mapFieldToInterruptSource(String fieldName, long fieldValue) {
+        String upperField = fieldName.toUpperCase();
+        
+        // Pattern 1: Direct interrupt source names
+        if (upperField.matches("(EXTINT|INT|IRQ)\\d+")) {
+            return upperField;
+        }
+        
+        // Pattern 2: Sense fields (common in EIC) - SENSE7 -> EXTINT7
+        java.util.regex.Pattern sensePattern = java.util.regex.Pattern.compile("SENSE(\\d+)");
+        java.util.regex.Matcher senseMatcher = sensePattern.matcher(upperField);
+        if (senseMatcher.find()) {
+            return "EXTINT" + senseMatcher.group(1);
+        }
+        
+        // Pattern 3: Channel fields - CH3 -> CH3_INT
+        java.util.regex.Pattern channelPattern = java.util.regex.Pattern.compile("CH(\\d+)");
+        java.util.regex.Matcher channelMatcher = channelPattern.matcher(upperField);
+        if (channelMatcher.find()) {
+            return "CH" + channelMatcher.group(1) + "_INT";
+        }
+        
+        // Pattern 4: Timer/Counter patterns - OC1, CC2, etc.
+        if (upperField.matches("(OC|CC|IC)\\d+")) {
+            return upperField + "_INT";
+        }
+        
+        // Pattern 5: Common interrupt source patterns
+        if (upperField.matches("(OVF|OVIE|COMPA|COMPB|CAPT|ERROR|READY|DONE|SUSP|RESRDY|ENABLE)")) {
+            return upperField;
+        }
+        
+        // Pattern 6: Enable fields with numbers - convert to interrupt source
+        java.util.regex.Pattern enablePattern = java.util.regex.Pattern.compile("(\\w+)(\\d+)EN");
+        java.util.regex.Matcher enableMatcher = enablePattern.matcher(upperField);
+        if (enableMatcher.find()) {
+            return enableMatcher.group(1) + enableMatcher.group(2);
+        }
+        
+        return null;
+    }
+
+    /**
+     * Find interrupt source using generic pattern matching (fallback method)
+     */
+    private String findInterruptSourceByPattern(String comment) {
+        // Look for common interrupt source patterns in the comment
+        String[] patterns = {
+            "(EXTINT\\d+)",
+            "(INT\\d+)",
+            "(IRQ\\d+)", 
+            "(CH\\d+_INT)",
+            "(OVF|COMPA|COMPB|CAPT|ERROR|READY|DONE)",
+            "(SENSE\\d+)",
+            "(\\w+_INT\\d*)"
+        };
+        
+        for (String patternStr : patterns) {
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(patternStr, java.util.regex.Pattern.CASE_INSENSITIVE);
+            java.util.regex.Matcher matcher = pattern.matcher(comment);
+            if (matcher.find()) {
+                String found = matcher.group(1).toUpperCase();
+                
+                // Convert SENSE patterns to EXTINT
+                if (found.startsWith("SENSE")) {
+                    java.util.regex.Pattern sensePattern = java.util.regex.Pattern.compile("SENSE(\\d+)");
+                    java.util.regex.Matcher senseMatcher = sensePattern.matcher(found);
+                    if (senseMatcher.find()) {
+                        return "EXTINT" + senseMatcher.group(1);
+                    }
+                }
+                
+                return found;
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Select the most specific interrupt source from a list of candidates
+     */
+    private String selectBestInterruptSource(List<String> sources) {
+        if (sources.size() == 1) {
+            return sources.get(0);
+        }
+        
+        // Prioritize more specific sources
+        for (String source : sources) {
+            // Prefer numbered interrupt sources (EXTINT7, CH3_INT, etc.)
+            if (source.matches(".+\\d+.*")) {
+                return source;
+            }
+        }
+        
+        // Return the first source if no numbered ones found
+        return sources.get(0);
+    }
+
+    /**
+     * Parse hexadecimal or decimal string to long value
+     */
+    private long parseHexOrDecimal(String value) {
+        if (value.startsWith("0x") || value.startsWith("0X")) {
+            return Long.parseUnsignedLong(value.substring(2), 16);
+        } else {
+            return Long.parseUnsignedLong(value, 10);
+        }
+    }
+
+    /**
+     * Parse bit field information from SVD comments
+     */
+    private void parseBitFields(String comment, InterruptInfo info) {
+        // Extract bit field information from {...} pattern
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\\{([^}]+)\\}");
+        java.util.regex.Matcher matcher = pattern.matcher(comment);
+        
+        if (matcher.find()) {
+            String bitFields = matcher.group(1);
+            info.bitFieldConfig = bitFields;
+            
+            // Look for specific interrupt sources in bit fields
+            if (bitFields.contains("SENSE") && bitFields.contains("RISE")) {
+                info.triggerType = "rising_edge";
+            } else if (bitFields.contains("SENSE") && bitFields.contains("FALL")) {
+                info.triggerType = "falling_edge";
+            } else if (bitFields.contains("SENSE") && bitFields.contains("BOTH")) {
+                info.triggerType = "both_edges";
+            }
+        }
+    }
+
+    /**
+     * Store peripheral configuration for later correlation with interrupts
+     */
+    private void storePeripheralConfig(String peripheral, String register, Address address, 
+                                     String value, String comment, Map<Integer, InterruptInfo> interruptMap) {
+        // For now, create a placeholder entry that might be correlated later
+        // This handles cases where we see peripheral config but don't immediately know the IRQ number
+        String key = peripheral + "_CONFIG";
+        InterruptInfo placeholder = new InterruptInfo(-1, key, "peripheral_config");
+        placeholder.peripheralName = peripheral;
+        placeholder.registerName = register;
+        placeholder.hasPeripheralConfig = true;
+        placeholder.peripheralConfigAddress = address.getOffset();
+        placeholder.configuredValue = value;
+        placeholder.svdDescription = extractDescription(comment);
+    }
+
+    /**
+     * Validate that an address looks like valid ARM code
+     */
+    private boolean isValidCodeAddress(Program program, long address) {
+        try {
+            // Check if address is in a reasonable range for ARM Cortex-M
+            if (address < 0x1000 || address > 0x20000000) {
+                return false;
+            }
+            
+            // Check if address is in an executable memory block
+            Address addr = program.getAddressFactory().getAddress(String.format("0x%08X", address));
+            if (addr == null) return false;
+            
+            MemoryBlock block = program.getMemory().getBlock(addr);
+            if (block == null) return false;
+            
+            return block.isExecute() || block.getName().toLowerCase().contains("flash") || 
+                   block.getName().toLowerCase().contains("rom") || block.getName().toLowerCase().contains("code");
+            
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Analyze peripheral register configurations for interrupt enables
+     */
+    private void analyzePeripheralInterruptConfig(Program program, Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            ReferenceManager refManager = program.getReferenceManager();
+            
+            // Common peripheral interrupt enable register patterns
+            String[] interruptRegisterPatterns = {
+                "INTENSET", "INTENCLR", "INTEN", "IER", "IMASK", "IE", "INT_EN"
+            };
+            
+            for (MemoryBlock block : program.getMemory().getBlocks()) {
+                // Focus on peripheral memory regions (typically above 0x40000000 for ARM Cortex-M)
+                if (block.getStart().getOffset() >= 0x40000000L) {
+                    analyzePeripheralBlock(program, block, interruptMap, interruptRegisterPatterns);
+                }
+            }
+            
+        } catch (Exception e) {
+            Msg.error(this, "Error analyzing peripheral interrupt config: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Analyze a specific peripheral memory block for interrupt configurations
+     */
+    private void analyzePeripheralBlock(Program program, MemoryBlock block, 
+                                      Map<Integer, InterruptInfo> interruptMap, 
+                                      String[] patterns) {
+        try {
+            ReferenceManager refManager = program.getReferenceManager();
+            Listing listing = program.getListing();
+            
+            Address start = block.getStart();
+            Address end = block.getEnd();
+            
+            // Look for writes to addresses in this block
+            for (Address addr = start; addr.compareTo(end) <= 0; addr = addr.add(4)) {
+                ReferenceIterator refs = refManager.getReferencesTo(addr);
+                
+                while (refs.hasNext()) {
+                    Reference ref = refs.next();
+                    if (ref.getReferenceType().isWrite()) {
+                        // Check if this looks like an interrupt enable register
+                        String comment = getAddressComment(listing, addr);
+                        if (comment != null && containsInterruptPattern(comment, patterns)) {
+                            analyzeInterruptEnableWrite(program, ref, addr, comment, interruptMap);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Skip problematic blocks
+        }
+    }
+
+    /**
+     * Filter interrupts to only include those that are actually configured/used
+     */
+    private List<InterruptInfo> filterActiveInterrupts(Map<Integer, InterruptInfo> interruptMap) {
+        List<InterruptInfo> activeInterrupts = new ArrayList<>();
+        
+        // Find the most common handler address (likely the default/dummy handler)
+        Map<Long, Integer> handlerCounts = new HashMap<>();
+        for (InterruptInfo interrupt : interruptMap.values()) {
+            if (interrupt.handlerAddress != 0) {
+                handlerCounts.merge(interrupt.handlerAddress, 1, Integer::sum);
+            }
+        }
+        
+        // Identify the default handler (most common address)
+        long defaultHandler = 0;
+        int maxCount = 0;
+        for (Map.Entry<Long, Integer> entry : handlerCounts.entrySet()) {
+            if (entry.getValue() > maxCount) {
+                maxCount = entry.getValue();
+                defaultHandler = entry.getKey();
+            }
+        }
+        
+        // Include interrupts that meet certain criteria
+        for (InterruptInfo interrupt : interruptMap.values()) {
+            boolean shouldInclude = false;
+            
+            // Always include system exceptions
+            if (interrupt.type.equals("system_exception")) {
+                shouldInclude = true;
+            }
+            
+            // Include if it has a unique handler (not the default)
+            else if (interrupt.handlerAddress != 0 && interrupt.handlerAddress != defaultHandler) {
+                shouldInclude = true;
+                interrupt.confidence = "high";
+                interrupt.reason = "unique_handler";
+            }
+            
+            // Include if there's evidence of NVIC configuration
+            else if (!interrupt.nvicOperations.isEmpty()) {
+                shouldInclude = true;
+                interrupt.confidence = "medium";
+                interrupt.reason = "nvic_config";
+            }
+            
+            // Include if there's peripheral configuration evidence
+            else if (interrupt.hasPeripheralConfig) {
+                shouldInclude = true;
+                interrupt.confidence = "medium";
+                interrupt.reason = "peripheral_config";
+            }
+            
+            // Include if mentioned in comments
+            else if (interrupt.hasCommentInfo) {
+                shouldInclude = true;
+                interrupt.confidence = "low";
+                interrupt.reason = "comment_mention";
+            }
+            
+            if (shouldInclude) {
+                activeInterrupts.add(interrupt);
+            }
+        }
+        
+        return activeInterrupts;
+    }
+
+    // Helper methods for comment analysis
+    private String extractPeripheralName(String comment) {
+        // Look for peripheral names like "EIC", "TC0", "SERCOM0", etc.
+        String[] lines = comment.split("\n");
+        for (String line : lines) {
+            if (line.matches(".*\\b[A-Z]{2,}[0-9]*\\b.*")) {
+                String[] words = line.split("\\s+");
+                for (String word : words) {
+                    if (word.matches("[A-Z]{2,}[0-9]*")) {
+                        return word;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private String extractInterruptName(String comment) {
+        // Look for interrupt names like "EXTINT11", "COMPARE", etc.
+        if (comment.contains("EXTINT")) {
+            int idx = comment.indexOf("EXTINT");
+            return comment.substring(idx, Math.min(idx + 10, comment.length())).split("\\s")[0];
+        }
+        
+        String[] interruptKeywords = {"COMPARE", "OVERFLOW", "READY", "ERROR", "DONE"};
+        for (String keyword : interruptKeywords) {
+            if (comment.toUpperCase().contains(keyword)) {
+                return keyword;
+            }
+        }
+        
+        return null;
+    }
+
+    private String extractIRQNumberFromComment(String comment) {
+        // Look for patterns like "IRQ11", "Interrupt 11", "External Interrupt 11"
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("(?:IRQ|interrupt)\\s*(\\d+)", 
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+        java.util.regex.Matcher matcher = pattern.matcher(comment);
+        if (matcher.find()) {
+            return matcher.group(1);
+        }
+        return null;
+    }
+
+    private int mapPeripheralToIRQ(String peripheral, String interrupt) {
+        // Known IRQ mappings for SAME54 (common ARM Cortex-M4 microcontroller)
+        // This should ideally be loaded from SVD data, but for now use hardcoded mappings
+        
+        if (peripheral == null) return -1;
+        
+        switch (peripheral.toUpperCase()) {
+            case "EIC":
+                // External Interrupt Controller - typically IRQ 11 for SAME54
+                return 11;
+            case "FREQM":
+                return 12;
+            case "NVMCTRL":
+                return 13;
+            case "DMAC":
+                return 14; // Channel 0
+            case "EVSYS":
+                return 15; // Channel 0
+            case "SERCOM0":
+                return 16;
+            case "SERCOM1":
+                return 17;
+            case "SERCOM2":
+                return 18;
+            case "SERCOM3":
+                return 19;
+            case "SERCOM4":
+                return 20;
+            case "SERCOM5":
+                return 21;
+            case "SERCOM6":
+                return 22;
+            case "SERCOM7":
+                return 23;
+            case "CAN0":
+                return 24;
+            case "CAN1":
+                return 25;
+            case "USB":
+                return 26;
+            case "GMAC":
+                return 27;
+            case "TCC0":
+                return 28;
+            case "TCC1":
+                return 29;
+            case "TCC2":
+                return 30;
+            case "TCC3":
+                return 31;
+            case "TCC4":
+                return 32;
+            case "TC0":
+                return 33;
+            case "TC1":
+                return 34;
+            case "TC2":
+                return 35;
+            case "TC3":
+                return 36;
+            case "TC4":
+                return 37;
+            case "TC5":
+                return 38;
+            case "TC6":
+                return 39;
+            case "TC7":
+                return 40;
+            case "PDEC":
+                return 41;
+            case "ADC0":
+                return 42;
+            case "ADC1":
+                return 43;
+            case "AC":
+                return 44;
+            case "DAC":
+                return 45;
+            case "I2S":
+                return 46;
+            case "PCC":
+                return 47;
+            default:
+                return -1; // Unknown peripheral
+        }
+    }
+
+    /**
+     * Extract the written value from SVD comment (pattern: <== VALUE)
+     */
+    private String extractWrittenValueFromComment(String comment) {
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("<==\\s*(0x[0-9A-Fa-f]+|\\d+)");
+        java.util.regex.Matcher matcher = pattern.matcher(comment);
+        if (matcher.find()) {
+            return matcher.group(1);
+        }
+        return null;
+    }
+
+    /**
+     * Extract description from the second part of SVD comment
+     */
+    private String extractDescription(String descriptionPart) {
+        // Extract description before bit fields or other details
+        int idx = descriptionPart.indexOf("[");
+        if (idx > 0) {
+            return descriptionPart.substring(0, idx).trim();
+        }
+        
+        idx = descriptionPart.indexOf("{");
+        if (idx > 0) {
+            return descriptionPart.substring(0, idx).trim();
+        }
+        
+        return descriptionPart.trim();
+    }
+
+    private String getAddressComment(Listing listing, Address addr) {
+        // Get the most relevant comment for this address
+        String comment = listing.getComment(CodeUnit.PLATE_COMMENT, addr);
+        if (comment != null) return comment;
+        
+        comment = listing.getComment(CodeUnit.PRE_COMMENT, addr);
+        if (comment != null) return comment;
+        
+        comment = listing.getComment(CodeUnit.EOL_COMMENT, addr);
+        if (comment != null) return comment;
+        
+        return listing.getComment(CodeUnit.POST_COMMENT, addr);
+    }
+
+    private boolean containsInterruptPattern(String comment, String[] patterns) {
+        String upperComment = comment.toUpperCase();
+        for (String pattern : patterns) {
+            if (upperComment.contains(pattern)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void analyzeInterruptEnableWrite(Program program, Reference ref, Address addr, 
+                                           String comment, Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            // Extract interrupt information from the write operation
+            String peripheralName = extractPeripheralName(comment);
+            if (peripheralName != null) {
+                // This is a simplified analysis - would be more sophisticated with full SVD integration
+                Address fromAddr = ref.getFromAddress();
+                Instruction instr = program.getListing().getInstructionAt(fromAddr);
+                
+                if (instr != null) {
+                    Long value = extractImmediateValue(instr);
+                    if (value != null && value != 0) {
+                        // Create a placeholder interrupt entry
+                        int estimatedIRQ = (int) ((addr.getOffset() - 0x40000000L) / 0x1000) % 100; // Rough estimate
+                        InterruptInfo info = interruptMap.computeIfAbsent(estimatedIRQ, 
+                            k -> new InterruptInfo(k, peripheralName + "_INT", "external_irq"));
+                        info.hasPeripheralConfig = true;
+                        info.peripheralConfigAddress = fromAddr.getOffset();
+                        info.peripheralName = peripheralName;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Skip problematic instructions
+        }
+    }
+
+    /**
+     * Data class to hold interrupt information
+     */
+    private static class InterruptInfo {
+        int irqNumber;
+        String name;
+        String type;
+        long handlerAddress;
+        String handlerFunctionName;
+        boolean isHandlerFunction;
+        boolean enabled;
+        int vectorTableOffset;
+        List<NVICOperation> nvicOperations;
+        
+        // Enhanced analysis fields
+        boolean hasPeripheralConfig;
+        long peripheralConfigAddress;
+        String peripheralName;
+        String interruptSource;
+        boolean hasCommentInfo;
+        long commentInfoAddress;
+        String confidence;
+        String reason;
+        
+        // SVD-specific fields
+        String registerName;
+        String svdDescription;
+        String configuredValue;
+        String bitFieldConfig;
+        String triggerType;
+
+        InterruptInfo(int irqNumber, String name, String type) {
+            this.irqNumber = irqNumber;
+            this.name = name;
+            this.type = type;
+            this.handlerAddress = 0;
+            this.handlerFunctionName = null;
+            this.isHandlerFunction = false;
+            this.enabled = false;
+            this.vectorTableOffset = -1;
+            this.nvicOperations = new ArrayList<>();
+            this.hasPeripheralConfig = false;
+            this.peripheralConfigAddress = 0;
+            this.peripheralName = null;
+            this.interruptSource = null;
+            this.hasCommentInfo = false;
+            this.commentInfoAddress = 0;
+            this.confidence = "unknown";
+            this.reason = "vector_table";
+            
+            // SVD fields
+            this.registerName = null;
+            this.svdDescription = null;
+            this.configuredValue = null;
+            this.bitFieldConfig = null;
+            this.triggerType = null;
+        }
+    }
+
+    /**
+     * Data class to hold NVIC operation information
+     */
+    private static class NVICOperation {
+        String operation;
+        long address;
+        long value;
+
+        NVICOperation(String operation, long address, long value) {
+            this.operation = operation;
+            this.address = address;
+            this.value = value;
+        }
+    }
+
+    /**
+     * Data class to hold parsed SVD comment information
+     */
+    private static class SVDComment {
+        String peripheralName;
+        String registerName;
+        String description;
+        String configuredValue;
+        String fullComment;
+        Address address;
+
+        SVDComment(String peripheralName, String registerName, String description, 
+                  String configuredValue, String fullComment, Address address) {
+            this.peripheralName = peripheralName;
+            this.registerName = registerName;
+            this.description = description;
+            this.configuredValue = configuredValue;
+            this.fullComment = fullComment;
+            this.address = address;
+        }
+    }
+
+    /**
+     * Parse SVD comment structure into SVDComment object
+     * Expected format: "SVD: PERIPHERAL.REGISTER - Description <== VALUE"
+     */
+    private SVDComment parseSVDCommentStructure(String comment, Address address) {
+        try {
+            if (!comment.startsWith("SVD:")) {
+                return null;
+            }
+            
+            // Remove "SVD:" prefix
+            String content = comment.substring(4).trim();
+            
+            // Split by " - " to separate register info from description
+            String[] parts = content.split(" - ", 2);
+            if (parts.length < 2) {
+                return null;
+            }
+            
+            // Parse peripheral.register part
+            String regPart = parts[0].trim();
+            String[] regComponents = regPart.split("\\.", 2);
+            if (regComponents.length < 2) {
+                return null;
+            }
+            
+            String peripheralName = regComponents[0].trim();
+            String registerName = regComponents[1].trim();
+            
+            // Parse description and extract configured value
+            String descriptionPart = parts[1].trim();
+            String description = descriptionPart;
+            String configuredValue = null;
+            
+            // Look for "<== VALUE" pattern to extract configured value
+            int valueIndex = descriptionPart.indexOf(" <== ");
+            if (valueIndex != -1) {
+                description = descriptionPart.substring(0, valueIndex).trim();
+                configuredValue = descriptionPart.substring(valueIndex + 5).trim();
+            }
+            
+            return new SVDComment(peripheralName, registerName, description, 
+                                configuredValue, comment, address);
+                                
+        } catch (Exception e) {
+            // Return null for malformed comments
+            return null;
+        }
     }
 
     // ----------------------------------------------------------------------------------

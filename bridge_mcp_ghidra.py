@@ -287,6 +287,29 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
         params["filter"] = filter
     return safe_get("strings", params)
 
+@mcp.tool()
+def list_interrupts(offset: int = 0, limit: int = 100) -> list:
+    """
+    List all interrupts used in the program through comprehensive analysis.
+    
+    This analyzes multiple sources to identify interrupts:
+    1. ARM Cortex-M vector table analysis
+    2. NVIC register operations (interrupt enable/disable)
+    3. Interrupt handler function identification
+    
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of interrupts to return (default: 100)
+        
+    Returns:
+        List of interrupts with detailed information including:
+        - IRQ number and name
+        - Handler addresses and function names
+        - Enable status from NVIC operations
+        - Vector table information
+    """
+    return safe_get("interrupts", {"offset": offset, "limit": limit})
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
