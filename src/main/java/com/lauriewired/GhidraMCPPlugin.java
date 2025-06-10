@@ -1920,6 +1920,9 @@ public class GhidraMCPPlugin extends Plugin {
             // Step 1: Collect all SVD comments grouped by peripheral
             Map<String, List<SVDComment>> peripheralComments = collectSVDCommentsByPeripheral(program);
             
+            // Debug: Write all collected SVD comments to file
+            writeSVDCommentsToFile(peripheralComments);
+            
             // Step 2: For each peripheral, find the best interrupt configuration
             for (Map.Entry<String, List<SVDComment>> entry : peripheralComments.entrySet()) {
                 String peripheralName = entry.getKey();
@@ -2961,6 +2964,46 @@ public class GhidraMCPPlugin extends Plugin {
             this.configuredValue = configuredValue;
             this.fullComment = fullComment;
             this.address = address;
+        }
+    }
+
+    /**
+     * Write all collected SVD comments to a debug file for analysis
+     */
+    private void writeSVDCommentsToFile(Map<String, List<SVDComment>> peripheralComments) {
+        try {
+            java.io.FileWriter writer = new java.io.FileWriter("svd_comments_debug.txt");
+            writer.write("=== SVD Comments Debug Output ===\n");
+            writer.write("Total Peripherals: " + peripheralComments.size() + "\n\n");
+            
+            for (Map.Entry<String, List<SVDComment>> entry : peripheralComments.entrySet()) {
+                String peripheralName = entry.getKey();
+                List<SVDComment> comments = entry.getValue();
+                
+                writer.write("PERIPHERAL: " + peripheralName + " (" + comments.size() + " comments)\n");
+                writer.write("=" + "=".repeat(peripheralName.length() + 20) + "\n");
+                
+                for (int i = 0; i < comments.size(); i++) {
+                    SVDComment comment = comments.get(i);
+                    writer.write(String.format("[%d] %s.%s @ 0x%08X\n", 
+                        i + 1, comment.peripheralName, comment.registerName, 
+                        comment.address.getOffset()));
+                    writer.write("    Description: " + comment.description + "\n");
+                    if (comment.configuredValue != null) {
+                        writer.write("    Value: " + comment.configuredValue + "\n");
+                    }
+                    writer.write("    Full Comment: " + comment.fullComment + "\n");
+                    writer.write("    Priority: " + getInterruptConfigPriority(comment) + "\n");
+                    writer.write("\n");
+                }
+                writer.write("\n");
+            }
+            
+            writer.close();
+            Msg.info(this, "SVD comments written to svd_comments_debug.txt");
+            
+        } catch (Exception e) {
+            Msg.error(this, "Error writing SVD comments to file: " + e.getMessage());
         }
     }
 
