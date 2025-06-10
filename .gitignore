@@ -1,18 +1,33 @@
-# Maven target directory
+# Build artifacts
+# Maven
 /target/
+# Gradle
+/build/
+/dist/
+.gradle/
 
 # Compiled class files
 *.class
+
+# JAR files (except wrapper)
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
 
 # Logs
 *.log
 
 # IDE files
-# IntelliJ
+# IntelliJ IDEA
 .idea/
 *.iml
 *.iws
+*.ipr
 out/
+# Keep some IntelliJ settings that are useful to share
+!.idea/codeStyles/
+!.idea/inspectionProfiles/
+!.idea/scopes/
+!.idea/runConfigurations/
 
 # Eclipse
 .project
@@ -22,6 +37,13 @@ bin/
 
 # VS Code
 .vscode/
+
+# NetBeans
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
 
 # macOS
 .DS_Store
@@ -35,7 +57,10 @@ bin/
 .Spotlight-V100
 .Trashes
 
-# Maven Wrapper
+# Gradle Wrapper (keep the JAR)
+!gradle/wrapper/gradle-wrapper.jar
+
+# Maven Wrapper (keep the JAR)
 .mvn/
 !/.mvn/wrapper/maven-wrapper.jar
 mvnw
@@ -48,4 +73,41 @@ mvnw.cmd
 # Java crash logs (if any)
 hs_err_pid*
 replay_pid*
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Package files
+*.tar.gz
+*.zip
+# Keep only the final distribution ZIP
+!dist/GhidraMCP.zip
+
+# Python cache (for MCP bridge development)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Local Ghidra extensions directory (don't commit test installations)
+/Extensions/
+
+# Personal IDE configurations
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/dictionaries/
+.idea/shelf/
+.idea/modules.xml
+.idea/misc.xml
+.idea/inspectionProfiles/profiles_settings.xml
 

@@ -1,0 +1,162 @@
+plugins {
+    id 'java'
+    id 'idea'
+}
+
+ext.GHIDRA_INSTALL_DIR = file(System.getenv('GHIDRA_INSTALL_DIR') ?: '/opt/ghidra')
+
+if (!GHIDRA_INSTALL_DIR.exists()) {
+    throw new GradleException("GHIDRA_INSTALL_DIR is not set or does not exist: $GHIDRA_INSTALL_DIR")
+}
+
+ext.GHIDRA_EXTENSIONS_DIR = file("/Users/macrod/Library/ghidra/ghidra_11.3.1_PUBLIC/Extensions")
+
+if (!GHIDRA_EXTENSIONS_DIR.exists()) {
+    GHIDRA_EXTENSIONS_DIR.mkdirs()
+    println "Created Ghidra extensions directory: ${GHIDRA_EXTENSIONS_DIR}"
+}
+
+repositories {
+    mavenCentral()
+    flatDir { dirs "${GHIDRA_INSTALL_DIR}/Ghidra/Framework", "${GHIDRA_INSTALL_DIR}/Ghidra/Features" }
+}
+
+dependencies {
+    compileOnly fileTree(dir: "${GHIDRA_INSTALL_DIR}/Ghidra/Framework", include: "**/*.jar")
+    compileOnly fileTree(dir: "${GHIDRA_INSTALL_DIR}/Ghidra/Features", include: "**/*.jar")
+    
+    testImplementation 'junit:junit:3.8.1'
+}
+
+compileJava {
+    sourceCompatibility = "17"
+    targetCompatibility = "17"
+}
+
+jar {
+    archiveFileName = 'GhidraMCP.jar'
+}
+
+task buildExtension(type: Zip) {
+    dependsOn classes, jar
+    
+    // Create the root GhidraMCP directory structure
+    into(project.name) {
+        // Include main JAR in lib directory
+        from(jar) {
+            into 'lib'
+        }
+        
+        // Include extension metadata files from src/main/resources
+        from('src/main/resources') {
+            include 'extension.properties'
+            include 'Module.manifest'
+        }
+        
+        // Include documentation
+        from files('README.md')
+        
+        // Include Python MCP bridge
+        from files('bridge_mcp_ghidra.py')
+        from files('requirements.txt')
+    }
+    
+    archiveFileName = "${project.name}.zip"
+    destinationDirectory = file('dist')
+    
+    doLast {
+        println "Extension package created: ${archiveFile.get()}"
+        println "Structure matches official Ghidra extension format"
+    }
+}
+
+// Install extension by extracting to Ghidra extensions directory
+task installExtension(type: Copy) {
+    dependsOn buildExtension
+    
+    description = 'Build and install the GhidraMCP extension to the Ghidra extensions directory'
+    
+    // Extract the ZIP contents to the extensions directory
+    from zipTree("dist/${project.name}.zip")
+    into GHIDRA_EXTENSIONS_DIR
+    
+    doFirst {
+        println "Installing GhidraMCP extension..."
+        println "Target directory: ${GHIDRA_EXTENSIONS_DIR}/${project.name}"
+        
+        // Clean up any existing installation
+        delete "${GHIDRA_EXTENSIONS_DIR}/${project.name}"
+        delete "${GHIDRA_EXTENSIONS_DIR}/${project.name}.zip"
+    }
+    
+    doLast {
+        println ""
+        println "=== INSTALLATION COMPLETE ==="
+        println "Extension installed to: ${GHIDRA_EXTENSIONS_DIR}/${project.name}"
+        println ""
+        println "Installation includes:"
+        println "  - GhidraMCP.jar (main plugin)"
+        println "  - bridge_mcp_ghidra.py (MCP bridge)"
+        println "  - requirements.txt (Python dependencies)"
+        println "  - Extension metadata files"
+        println ""
+        println "Next steps:"
+        println "1. Restart Ghidra if it's currently running"
+        println "2. The extension should appear in File → Configure → Ghidra → Configure"
+        println "3. Enable the plugin in the 'Developer' category"
+        println "4. For debugging, run: ./gradlew debugExtension"
+        println ""
+    }
+}
+
+// Convenience task alias
+task install {
+    dependsOn installExtension
+    description = 'Alias for installExtension - builds and installs the GhidraMCP extension'
+}
+
+// Debug extension preparation task - RECOMMENDED METHOD
+task debugExtension {
+    dependsOn installExtension
+    
+    description = 'Prepares extension for debugging and provides debugging instructions'
+    
+    doLast {
+        println ""
+        println "=== DEBUGGING SETUP COMPLETE ==="
+        println ""
+        println "Extension installed with debug information to:"
+        println "  ${GHIDRA_EXTENSIONS_DIR}/${project.name}"
+        println ""
+        println "RECOMMENDED DEBUGGING WORKFLOW:"
+        println ""
+        println "METHOD 1: Use Ghidra's built-in debug script (default port 18001)"
+        println "1. Launch Ghidra with debug agent from terminal:"
+        println "   cd \"${GHIDRA_INSTALL_DIR}\""
+        println "   ./support/launch.sh debug jdk Ghidra 4G '' ghidra.GhidraRun"
+        println ""
+        println "2. In IntelliJ IDEA:"
+        println "   - Run → Edit Configurations"
+        println "   - Add new 'Remote JVM Debug' configuration"
+        println "   - Set Host: localhost, Port: 18001 (Ghidra's default debug port)"
+        println "   - Click 'Debug' to attach"
+        println ""
+        println "METHOD 2: Use custom port 5005"
+        println "1. Launch Ghidra with custom debug port (if needed):"
+        println "   cd \"${GHIDRA_INSTALL_DIR}\""
+        println "   ./ghidraRun -Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=n,address=5005"
+        println ""
+        println "2. In IntelliJ IDEA:"
+        println "   - Set Host: localhost, Port: 5005"
+        println ""
+        println "3. In Ghidra (both methods):"
+        println "   - Open a project"
+        println "   - The GhidraMCP extension should be loaded automatically"
+        println "   - Set breakpoints in IntelliJ and trigger extension functionality"
+        println ""
+        println "TIP: Method 1 is recommended as it uses Ghidra's standard debug configuration."
+        println "TIP: This method avoids UI responsiveness issues."
+        println "=== Ready for debugging! ==="
+        println ""
+    }
+}
