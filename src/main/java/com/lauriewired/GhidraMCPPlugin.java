@@ -2820,55 +2820,24 @@ public class GhidraMCPPlugin extends Plugin {
             }
         }
         
-        // Include interrupts that meet certain criteria
+        // Simplified filtering: only system interrupts and those with unique handlers
         for (InterruptInfo interrupt : interruptMap.values()) {
             boolean shouldInclude = false;
             
-            // Always include system exceptions
-            if (interrupt.type.equals("system_exception")) {
+            // Always include system/core interrupts (IRQ < 0)
+            if (interrupt.irqNumber < 0) {
                 shouldInclude = true;
+                interrupt.confidence = "high";
+                interrupt.reason = "system_exception";
             }
             
-            // PRIORITY 1: Include if explicitly enabled via SVD interrupt enable action
-            else if ("svd_interrupt_enable".equals(interrupt.reason) && interrupt.enabled) {
+            // Include external interrupts ONLY if they have unique handlers (not default)
+            else if (interrupt.irqNumber >= 0 && 
+                     interrupt.handlerAddress != 0 && 
+                     interrupt.handlerAddress != defaultHandler) {
                 shouldInclude = true;
-                // confidence and reason already set in processInterruptFromComment
-            }
-            
-            // PRIORITY 2: Include if it has a unique handler (not the default)
-            else if (interrupt.handlerAddress != 0 && interrupt.handlerAddress != defaultHandler) {
-                shouldInclude = true;
-                if (interrupt.confidence.equals("unknown")) {
-                    interrupt.confidence = "high";
-                    interrupt.reason = "unique_handler";
-                }
-            }
-            
-            // PRIORITY 3: Include if there's evidence of NVIC configuration (explicit enable)
-            else if (!interrupt.nvicOperations.isEmpty() && interrupt.enabled) {
-                shouldInclude = true;
-                if (interrupt.confidence.equals("unknown")) {
-                    interrupt.confidence = "medium";
-                    interrupt.reason = "nvic_config";
-                }
-            }
-            
-            // PRIORITY 4: Include if there's peripheral configuration evidence AND enabled
-            else if (interrupt.hasPeripheralConfig && (interrupt.enabled || interrupt.configuredValue != null)) {
-                shouldInclude = true;
-                if (interrupt.confidence.equals("unknown")) {
-                    interrupt.confidence = "medium";
-                    interrupt.reason = "peripheral_config";
-                }
-            }
-            
-            // PRIORITY 5: Include if mentioned in comments but ONLY if there's some evidence of enablement
-            else if (interrupt.hasCommentInfo && (interrupt.enabled || interrupt.hasPeripheralConfig)) {
-                shouldInclude = true;
-                if (interrupt.confidence.equals("unknown")) {
-                    interrupt.confidence = "low";
-                    interrupt.reason = "comment_mention";
-                }
+                interrupt.confidence = "high";
+                interrupt.reason = "unique_handler";
             }
             
             if (shouldInclude) {
