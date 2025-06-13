@@ -358,6 +358,10 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, listComments(offset, limit, filter, peripheral));
         });
 
+        server.createContext("/main_function", exchange -> {
+            sendResponse(exchange, getMainFunction());
+        });
+
         server.setExecutor(null);
         new Thread(() -> {
             try {
@@ -1600,6 +1604,83 @@ public class GhidraMCPPlugin extends Plugin {
         } catch (Exception e) {
             return "Error collecting comments: " + e.getMessage();
         }
+    }
+
+    /**
+     * Get the main function entry point identified from reset vector analysis
+     */
+    private String getMainFunction() {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return formatMainFunctionResponse(false, null, null, "No program loaded");
+        }
+
+        try {
+            Listing listing = program.getListing();
+            
+            // Search for the special main function SVD comment
+            for (MemoryBlock block : program.getMemory().getBlocks()) {
+                Address start = block.getStart();
+                Address end = block.getEnd();
+                
+                // Iterate through addresses in the block
+                for (Address address = start; address.compareTo(end) <= 0; address = address.add(1)) {
+                    // Check all comment types at each address
+                    for (int commentType : new int[]{CodeUnit.PLATE_COMMENT, CodeUnit.PRE_COMMENT, 
+                                                    CodeUnit.POST_COMMENT, CodeUnit.EOL_COMMENT}) {
+                        String comment = listing.getComment(commentType, address);
+                        if (comment != null && isMainFunctionComment(comment)) {
+                            // Found the main function comment
+                            String instructionAddress = String.format("0x%08X", address.getOffset());
+                            return formatMainFunctionResponse(true, instructionAddress, comment, null);
+                        }
+                    }
+                }
+            }
+            
+            // Main function comment not found
+            return formatMainFunctionResponse(false, null, null, null);
+            
+        } catch (Exception e) {
+            return formatMainFunctionResponse(false, null, null, "Error searching for main function: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Check if a comment is the special main function marker
+     */
+    private boolean isMainFunctionComment(String comment) {
+        return comment.startsWith("SVD: Main entry point") && 
+               comment.contains("Application start") &&
+               comment.contains("auto-identified from reset vector analysis");
+    }
+
+    /**
+     * Format the main function response as JSON
+     */
+    private String formatMainFunctionResponse(boolean found, String instructionAddress, String comment, String error) {
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"found\":").append(found).append(",");
+        
+        if (instructionAddress != null) {
+            json.append("\"instruction_address\":\"").append(instructionAddress).append("\",");
+        } else {
+            json.append("\"instruction_address\":null,");
+        }
+        
+        if (comment != null) {
+            json.append("\"comment\":\"").append(escapeJsonString(comment)).append("\"");
+        } else {
+            json.append("\"comment\":null");
+        }
+        
+        if (error != null) {
+            json.append(",\"error\":\"").append(escapeJsonString(error)).append("\"");
+        }
+        
+        json.append("}");
+        return json.toString();
     }
 
     /**

@@ -346,6 +346,22 @@ def list_comments(offset: int = 0, limit: int = 1000, filter: str = None, periph
         params["peripheral"] = peripheral
     return safe_get("comments", params)
 
+@mcp.tool()
+def get_main_function() -> dict:
+    """
+    Get the main function entry point identified from reset vector analysis.
+    
+    Searches for the special SVD comment that marks the firmware's main function:
+    "SVD: Main entry point - Application start (auto-identified from reset vector analysis)"
+    
+    Returns:
+        Dictionary containing:
+        - found: Boolean indicating if main function was found
+        - instruction_address: Memory address of the main function entry point (or None if not found)
+        - comment: The full SVD comment text if found (or None if not found)
+    """
+    return safe_get("main_function", {})
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
