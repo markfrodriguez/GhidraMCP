@@ -1916,6 +1916,9 @@ public class GhidraMCPPlugin extends Plugin {
         sb.append(String.format("IRQ %d: %s", interrupt.irqNumber, interrupt.name));
         sb.append(String.format(" [%s]", interrupt.type));
         
+        // Add vector number for clarity
+        sb.append(String.format(" Vector:%d", interrupt.irqNumber));
+        
         // Add confidence and reason
         if (!"unknown".equals(interrupt.confidence)) {
             sb.append(String.format(" {%s:%s}", interrupt.confidence.toUpperCase(), interrupt.reason));
@@ -2035,11 +2038,94 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
-     * Analyze GhidraSVD comments using peripheral-centric approach
+     * Analyze GhidraSVD comments using new pipe-delimited format with INTERRUPT context
      */
     private void analyzeGhidraSVDComments(Program program, Map<Integer, InterruptInfo> interruptMap) {
         try {
-            // Step 1: Collect all SVD comments grouped by peripheral
+            // Collect all SVD comments using new format parser
+            List<CommentInfo> allComments = collectAllSVDComments(program, null, null);
+            
+            // Process comments to extract interrupt information
+            for (CommentInfo commentInfo : allComments) {
+                if (commentInfo.interrupts != null && !commentInfo.interrupts.isEmpty()) {
+                    // Process each interrupt in the comment
+                    for (Map<String, String> interrupt : commentInfo.interrupts) {
+                        processInterruptFromComment(commentInfo, interrupt, interruptMap);
+                    }
+                }
+            }
+            
+            // Fallback: Use legacy peripheral-centric approach for any remaining unmapped interrupts
+            analyzeLegacySVDComments(program, interruptMap);
+            
+        } catch (Exception e) {
+            Msg.error(this, "Error analyzing GhidraSVD comments: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Process interrupt information extracted from new SVD comment format
+     */
+    private void processInterruptFromComment(CommentInfo commentInfo, Map<String, String> interrupt, 
+                                           Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            String action = interrupt.get("action");
+            String interruptName = interrupt.get("name");
+            String vectorStr = interrupt.get("vector");
+            
+            if (action == null || interruptName == null || vectorStr == null) {
+                return; // Skip incomplete interrupt info
+            }
+            
+            // Parse vector number
+            int vectorNumber;
+            try {
+                vectorNumber = Integer.parseInt(vectorStr);
+            } catch (NumberFormatException e) {
+                return; // Skip invalid vector numbers
+            }
+            
+            // Create or update interrupt info
+            InterruptInfo info = interruptMap.computeIfAbsent(vectorNumber, 
+                k -> new InterruptInfo(k, interruptName, "external_irq"));
+            
+            // Update with SVD comment details
+            info.name = interruptName;
+            info.peripheralName = commentInfo.peripheral;
+            info.registerName = commentInfo.register;
+            info.svdDescription = commentInfo.peripheralDesc;
+            info.hasCommentInfo = true;
+            info.hasPeripheralConfig = true;
+            info.peripheralConfigAddress = commentInfo.address.getOffset();
+            
+            // Set interrupt state based on action
+            if ("ENABLE".equalsIgnoreCase(action)) {
+                info.enabled = true;
+                info.confidence = "high";
+                info.reason = "svd_interrupt_enable";
+            } else if ("DISABLE".equalsIgnoreCase(action)) {
+                info.enabled = false;
+                info.confidence = "medium";
+                info.reason = "svd_interrupt_disable";
+            } else if ("STATUS".equalsIgnoreCase(action)) {
+                info.confidence = "low";
+                info.reason = "svd_interrupt_status";
+            }
+            
+            // Add operation details
+            info.configuredValue = commentInfo.operation;
+            
+        } catch (Exception e) {
+            // Skip problematic interrupt entries
+        }
+    }
+
+    /**
+     * Legacy peripheral-centric approach for backwards compatibility
+     */
+    private void analyzeLegacySVDComments(Program program, Map<Integer, InterruptInfo> interruptMap) {
+        try {
+            // Step 1: Collect all SVD comments grouped by peripheral (legacy format)
             Map<String, List<SVDComment>> peripheralComments = collectSVDCommentsByPeripheral(program);
             
             // Debug: Write all collected SVD comments to file
@@ -2059,7 +2145,7 @@ public class GhidraMCPPlugin extends Plugin {
             }
             
         } catch (Exception e) {
-            Msg.error(this, "Error analyzing GhidraSVD comments: " + e.getMessage());
+            Msg.error(this, "Error analyzing legacy SVD comments: " + e.getMessage());
         }
     }
 
@@ -2743,32 +2829,46 @@ public class GhidraMCPPlugin extends Plugin {
                 shouldInclude = true;
             }
             
-            // Include if it has a unique handler (not the default)
+            // PRIORITY 1: Include if explicitly enabled via SVD interrupt enable action
+            else if ("svd_interrupt_enable".equals(interrupt.reason) && interrupt.enabled) {
+                shouldInclude = true;
+                // confidence and reason already set in processInterruptFromComment
+            }
+            
+            // PRIORITY 2: Include if it has a unique handler (not the default)
             else if (interrupt.handlerAddress != 0 && interrupt.handlerAddress != defaultHandler) {
                 shouldInclude = true;
-                interrupt.confidence = "high";
-                interrupt.reason = "unique_handler";
+                if (interrupt.confidence.equals("unknown")) {
+                    interrupt.confidence = "high";
+                    interrupt.reason = "unique_handler";
+                }
             }
             
-            // Include if there's evidence of NVIC configuration
-            else if (!interrupt.nvicOperations.isEmpty()) {
+            // PRIORITY 3: Include if there's evidence of NVIC configuration (explicit enable)
+            else if (!interrupt.nvicOperations.isEmpty() && interrupt.enabled) {
                 shouldInclude = true;
-                interrupt.confidence = "medium";
-                interrupt.reason = "nvic_config";
+                if (interrupt.confidence.equals("unknown")) {
+                    interrupt.confidence = "medium";
+                    interrupt.reason = "nvic_config";
+                }
             }
             
-            // Include if there's peripheral configuration evidence
-            else if (interrupt.hasPeripheralConfig) {
+            // PRIORITY 4: Include if there's peripheral configuration evidence AND enabled
+            else if (interrupt.hasPeripheralConfig && (interrupt.enabled || interrupt.configuredValue != null)) {
                 shouldInclude = true;
-                interrupt.confidence = "medium";
-                interrupt.reason = "peripheral_config";
+                if (interrupt.confidence.equals("unknown")) {
+                    interrupt.confidence = "medium";
+                    interrupt.reason = "peripheral_config";
+                }
             }
             
-            // Include if mentioned in comments
-            else if (interrupt.hasCommentInfo) {
+            // PRIORITY 5: Include if mentioned in comments but ONLY if there's some evidence of enablement
+            else if (interrupt.hasCommentInfo && (interrupt.enabled || interrupt.hasPeripheralConfig)) {
                 shouldInclude = true;
-                interrupt.confidence = "low";
-                interrupt.reason = "comment_mention";
+                if (interrupt.confidence.equals("unknown")) {
+                    interrupt.confidence = "low";
+                    interrupt.reason = "comment_mention";
+                }
             }
             
             if (shouldInclude) {
