@@ -354,7 +354,8 @@ public class GhidraMCPPlugin extends Plugin {
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit = parseIntOrDefault(qparams.get("limit"), 1000);
             String filter = qparams.get("filter");
-            sendResponse(exchange, listComments(offset, limit, filter));
+            String peripheral = qparams.get("peripheral");
+            sendResponse(exchange, listComments(offset, limit, filter, peripheral));
         });
 
         server.setExecutor(null);
@@ -1572,12 +1573,12 @@ public class GhidraMCPPlugin extends Plugin {
     /**
      * List all SVD comments in the program with their addresses and parsed information
      */
-    private String listComments(int offset, int limit, String filter) {
+    private String listComments(int offset, int limit, String filter, String peripheral) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
 
         try {
-            List<CommentInfo> comments = collectAllSVDComments(program, filter);
+            List<CommentInfo> comments = collectAllSVDComments(program, filter, peripheral);
             
             // Apply pagination
             List<Map<String, Object>> formattedResults = new ArrayList<>();
@@ -3088,7 +3089,7 @@ public class GhidraMCPPlugin extends Plugin {
     /**
      * Collect all SVD comments in the program and parse them according to the new format
      */
-    private List<CommentInfo> collectAllSVDComments(Program program, String filter) {
+    private List<CommentInfo> collectAllSVDComments(Program program, String filter, String peripheral) {
         List<CommentInfo> comments = new ArrayList<>();
         Listing listing = program.getListing();
         
@@ -3104,11 +3105,14 @@ public class GhidraMCPPlugin extends Plugin {
                                                 CodeUnit.POST_COMMENT, CodeUnit.EOL_COMMENT}) {
                     String comment = listing.getComment(commentType, address);
                     if (comment != null && comment.startsWith("SVD:")) {
-                        // Apply filter if specified
+                        // Apply text filter if specified
                         if (filter == null || comment.toLowerCase().contains(filter.toLowerCase())) {
                             CommentInfo commentInfo = parseNewSVDCommentFormat(comment, address);
                             if (commentInfo != null) {
-                                comments.add(commentInfo);
+                                // Apply peripheral filter if specified
+                                if (peripheral == null || peripheral.equalsIgnoreCase(commentInfo.peripheral)) {
+                                    comments.add(commentInfo);
+                                }
                             }
                         }
                     }

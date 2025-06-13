@@ -311,7 +311,7 @@ def list_interrupts(offset: int = 0, limit: int = 100) -> list:
     return safe_get("interrupts", {"offset": offset, "limit": limit})
 
 @mcp.tool()
-def list_comments(offset: int = 0, limit: int = 1000, filter: str = None) -> list:
+def list_comments(offset: int = 0, limit: int = 1000, filter: str = None, peripheral: str = None) -> list:
     """
     List all SVD comments in the program with their memory addresses.
     
@@ -325,6 +325,9 @@ def list_comments(offset: int = 0, limit: int = 1000, filter: str = None) -> lis
         offset: Pagination offset (default: 0)
         limit: Maximum number of comments to return (default: 1000)
         filter: Optional filter to match within comment content
+        peripheral: Optional peripheral name to filter by (e.g., "EIC", "RTC", "DMAC")
+                   If provided, returns only comments for that peripheral.
+                   If not provided or no comments found, returns all comments.
         
     Returns:
         List of SVD comments with their addresses and parsed information:
@@ -332,13 +335,15 @@ def list_comments(offset: int = 0, limit: int = 1000, filter: str = None) -> lis
         - comment: Full SVD comment text
         - peripheral: Peripheral name (e.g., "EIC", "RTC", "DMAC")
         - register: Register name (e.g., "CTRLA", "INTENSET")
-        - operation: Operation type (READ, WRITE:0xVALUE)
+        - operation: Operation type (read, WRITE:0xVALUE)
         - fields: Parsed field information
         - interrupts: Associated interrupt context
     """
     params = {"offset": offset, "limit": limit}
     if filter:
         params["filter"] = filter
+    if peripheral:
+        params["peripheral"] = peripheral
     return safe_get("comments", params)
 
 def main():
