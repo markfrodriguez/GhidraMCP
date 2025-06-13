@@ -310,6 +310,37 @@ def list_interrupts(offset: int = 0, limit: int = 100) -> list:
     """
     return safe_get("interrupts", {"offset": offset, "limit": limit})
 
+@mcp.tool()
+def list_comments(offset: int = 0, limit: int = 1000, filter: str = None) -> list:
+    """
+    List all SVD comments in the program with their memory addresses.
+    
+    SVD comments provide detailed peripheral register information including:
+    - Peripheral and register names
+    - Register descriptions and field details
+    - Configured values and operations
+    - Interrupt context information
+    
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of comments to return (default: 1000)
+        filter: Optional filter to match within comment content
+        
+    Returns:
+        List of SVD comments with their addresses and parsed information:
+        - instruction_address: Memory address of the instruction where comment is located
+        - comment: Full SVD comment text
+        - peripheral: Peripheral name (e.g., "EIC", "RTC", "DMAC")
+        - register: Register name (e.g., "CTRLA", "INTENSET")
+        - operation: Operation type (READ, WRITE:0xVALUE)
+        - fields: Parsed field information
+        - interrupts: Associated interrupt context
+    """
+    params = {"offset": offset, "limit": limit}
+    if filter:
+        params["filter"] = filter
+    return safe_get("comments", params)
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,

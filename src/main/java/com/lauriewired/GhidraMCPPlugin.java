@@ -349,6 +349,14 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, listInterrupts(offset, limit));
         });
 
+        server.createContext("/comments", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 1000);
+            String filter = qparams.get("filter");
+            sendResponse(exchange, listComments(offset, limit, filter));
+        });
+
         server.setExecutor(null);
         new Thread(() -> {
             try {
@@ -1558,6 +1566,38 @@ public class GhidraMCPPlugin extends Plugin {
             return paginateList(formattedResults, offset, limit);
         } catch (Exception e) {
             return "Error analyzing interrupts: " + e.getMessage();
+        }
+    }
+
+    /**
+     * List all SVD comments in the program with their addresses and parsed information
+     */
+    private String listComments(int offset, int limit, String filter) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+
+        try {
+            List<CommentInfo> comments = collectAllSVDComments(program, filter);
+            
+            // Apply pagination
+            List<Map<String, Object>> formattedResults = new ArrayList<>();
+            for (CommentInfo comment : comments) {
+                Map<String, Object> commentData = new HashMap<>();
+                commentData.put("instruction_address", String.format("0x%08X", comment.address.getOffset()));
+                commentData.put("comment", comment.fullComment);
+                commentData.put("peripheral", comment.peripheral);
+                commentData.put("register", comment.register);
+                commentData.put("operation", comment.operation);
+                commentData.put("size", comment.size);
+                commentData.put("fields", comment.fields);
+                commentData.put("interrupts", comment.interrupts);
+                commentData.put("mode_context", comment.modeContext);
+                formattedResults.add(commentData);
+            }
+            
+            return formatCommentsAsJson(formattedResults, offset, limit);
+        } catch (Exception e) {
+            return "Error collecting comments: " + e.getMessage();
         }
     }
 
@@ -2946,6 +2986,44 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
+     * Data class to hold comprehensive SVD comment information for list_comments endpoint
+     */
+    private static class CommentInfo {
+        String peripheral;
+        String cluster;
+        String register;
+        String peripheralDesc;
+        String clusterDesc;
+        String registerDesc;
+        String size;
+        String operation;
+        List<Map<String, String>> fields;
+        List<Map<String, String>> interrupts;
+        String modeContext;
+        String fullComment;
+        Address address;
+
+        CommentInfo(String peripheral, String cluster, String register, String peripheralDesc,
+                   String clusterDesc, String registerDesc, String size, String operation,
+                   List<Map<String, String>> fields, List<Map<String, String>> interrupts,
+                   String modeContext, String fullComment, Address address) {
+            this.peripheral = peripheral;
+            this.cluster = cluster;
+            this.register = register;
+            this.peripheralDesc = peripheralDesc;
+            this.clusterDesc = clusterDesc;
+            this.registerDesc = registerDesc;
+            this.size = size;
+            this.operation = operation;
+            this.fields = fields;
+            this.interrupts = interrupts;
+            this.modeContext = modeContext;
+            this.fullComment = fullComment;
+            this.address = address;
+        }
+    }
+
+    /**
      * Data class to hold parsed SVD comment information
      */
     private static class SVDComment {
@@ -3005,6 +3083,282 @@ public class GhidraMCPPlugin extends Plugin {
         } catch (Exception e) {
             Msg.error(this, "Error writing SVD comments to file: " + e.getMessage());
         }
+    }
+
+    /**
+     * Collect all SVD comments in the program and parse them according to the new format
+     */
+    private List<CommentInfo> collectAllSVDComments(Program program, String filter) {
+        List<CommentInfo> comments = new ArrayList<>();
+        Listing listing = program.getListing();
+        
+        // Iterate through all memory blocks
+        for (MemoryBlock block : program.getMemory().getBlocks()) {
+            Address start = block.getStart();
+            Address end = block.getEnd();
+            
+            // Iterate through addresses in the block
+            for (Address address = start; address.compareTo(end) <= 0; address = address.add(1)) {
+                // Check all comment types at each address
+                for (int commentType : new int[]{CodeUnit.PLATE_COMMENT, CodeUnit.PRE_COMMENT, 
+                                                CodeUnit.POST_COMMENT, CodeUnit.EOL_COMMENT}) {
+                    String comment = listing.getComment(commentType, address);
+                    if (comment != null && comment.startsWith("SVD:")) {
+                        // Apply filter if specified
+                        if (filter == null || comment.toLowerCase().contains(filter.toLowerCase())) {
+                            CommentInfo commentInfo = parseNewSVDCommentFormat(comment, address);
+                            if (commentInfo != null) {
+                                comments.add(commentInfo);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return comments;
+    }
+
+    /**
+     * Parse the new pipe-delimited SVD comment format
+     * Format: SVD: PERIPHERAL[CLUSTER].REGISTER|PERIPHERAL_DESC|CLUSTER_DESC|REGISTER_DESC|SIZE|OPERATION|FIELDS|INTERRUPTS|MODE_CONTEXT
+     */
+    private CommentInfo parseNewSVDCommentFormat(String comment, Address address) {
+        try {
+            if (!comment.startsWith("SVD: ")) {
+                return null;
+            }
+            
+            // Remove "SVD: " prefix
+            String content = comment.substring(5);
+            
+            // Split by pipe delimiters
+            String[] parts = content.split("\\|", -1); // -1 to include empty strings
+            if (parts.length < 9) {
+                return null; // Not enough parts for new format
+            }
+            
+            // Parse peripheral and register
+            String peripheralRegister = parts[0];
+            String peripheral = "";
+            String cluster = "";
+            String register = "";
+            
+            // Extract peripheral[cluster].register
+            if (peripheralRegister.contains(".")) {
+                String[] regParts = peripheralRegister.split("\\.", 2);
+                String peripheralPart = regParts[0];
+                register = regParts[1];
+                
+                // Check for cluster in brackets
+                if (peripheralPart.contains("[") && peripheralPart.contains("]")) {
+                    int startBracket = peripheralPart.indexOf('[');
+                    int endBracket = peripheralPart.indexOf(']');
+                    peripheral = peripheralPart.substring(0, startBracket);
+                    cluster = peripheralPart.substring(startBracket + 1, endBracket);
+                } else {
+                    peripheral = peripheralPart;
+                    cluster = "N/A";
+                }
+            }
+            
+            String peripheralDesc = parts[1];
+            String clusterDesc = parts[2];
+            String registerDesc = parts[3];
+            String size = parts[4];
+            String operation = parts[5];
+            String fieldsStr = parts[6];
+            String interruptsStr = parts[7];
+            String modeContext = parts[8];
+            
+            // Parse fields (separated by ^)
+            List<Map<String, String>> fields = parseFields(fieldsStr);
+            
+            // Parse interrupts (separated by ^)  
+            List<Map<String, String>> interrupts = parseInterrupts(interruptsStr);
+            
+            return new CommentInfo(peripheral, cluster, register, peripheralDesc, clusterDesc,
+                                 registerDesc, size, operation, fields, interrupts, modeContext, 
+                                 comment, address);
+                                 
+        } catch (Exception e) {
+            // Return null for malformed comments
+            return null;
+        }
+    }
+
+    /**
+     * Parse field information from the FIELDS section
+     * Format: FIELD_NAME:OFFSET:WIDTH(VALUE):FIELD_DESCRIPTION:ENUMERATED_VALUE_DESCRIPTION
+     */
+    private List<Map<String, String>> parseFields(String fieldsStr) {
+        List<Map<String, String>> fields = new ArrayList<>();
+        if (fieldsStr == null || fieldsStr.isEmpty() || "N/A".equals(fieldsStr)) {
+            return fields;
+        }
+        
+        String[] fieldParts = fieldsStr.split("\\^");
+        for (String fieldStr : fieldParts) {
+            Map<String, String> field = parseField(fieldStr);
+            if (field != null) {
+                fields.add(field);
+            }
+        }
+        
+        return fields;
+    }
+
+    /**
+     * Parse a single field
+     */
+    private Map<String, String> parseField(String fieldStr) {
+        try {
+            // FIELD_NAME:OFFSET:WIDTH(VALUE):FIELD_DESCRIPTION:ENUMERATED_VALUE_DESCRIPTION
+            String[] parts = fieldStr.split(":", 5);
+            if (parts.length < 4) {
+                return null;
+            }
+            
+            Map<String, String> field = new HashMap<>();
+            field.put("name", parts[0]);
+            field.put("offset", parts[1]);
+            
+            // Extract width and value
+            String widthValue = parts[2];
+            if (widthValue.contains("(") && widthValue.contains(")")) {
+                int parenStart = widthValue.indexOf('(');
+                int parenEnd = widthValue.indexOf(')');
+                field.put("width", widthValue.substring(0, parenStart));
+                field.put("value", widthValue.substring(parenStart + 1, parenEnd));
+            }
+            
+            field.put("description", parts[3]);
+            if (parts.length > 4) {
+                field.put("enumerated_description", parts[4]);
+            }
+            
+            return field;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Parse interrupt information from the INTERRUPTS section
+     * Format: ACTION:INTERRUPT_NAME:VECTOR_NUMBER
+     */
+    private List<Map<String, String>> parseInterrupts(String interruptsStr) {
+        List<Map<String, String>> interrupts = new ArrayList<>();
+        if (interruptsStr == null || interruptsStr.isEmpty() || "N/A".equals(interruptsStr)) {
+            return interrupts;
+        }
+        
+        String[] interruptParts = interruptsStr.split("\\^");
+        for (String interruptStr : interruptParts) {
+            String[] parts = interruptStr.split(":", 3);
+            if (parts.length >= 3) {
+                Map<String, String> interrupt = new HashMap<>();
+                interrupt.put("action", parts[0]);
+                interrupt.put("name", parts[1]);
+                interrupt.put("vector", parts[2]);
+                interrupts.add(interrupt);
+            }
+        }
+        
+        return interrupts;
+    }
+
+    /**
+     * Format comments as JSON string manually (simple approach)
+     */
+    private String formatCommentsAsJson(List<Map<String, Object>> items, int offset, int limit) {
+        int start = Math.min(offset, items.size());
+        int end = Math.min(offset + limit, items.size());
+        List<Map<String, Object>> paginatedItems = items.subList(start, end);
+        
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"results\":[");
+        
+        for (int i = 0; i < paginatedItems.size(); i++) {
+            if (i > 0) json.append(",");
+            Map<String, Object> item = paginatedItems.get(i);
+            json.append("{");
+            
+            boolean first = true;
+            for (Map.Entry<String, Object> entry : item.entrySet()) {
+                if (!first) json.append(",");
+                first = false;
+                json.append("\"").append(entry.getKey()).append("\":");
+                Object value = entry.getValue();
+                if (value instanceof String) {
+                    json.append("\"").append(escapeJsonString((String) value)).append("\"");
+                } else if (value instanceof List) {
+                    json.append(formatListAsJson((List<?>) value));
+                } else {
+                    json.append("\"").append(String.valueOf(value)).append("\"");
+                }
+            }
+            
+            json.append("}");
+        }
+        
+        json.append("],");
+        json.append("\"offset\":").append(offset).append(",");
+        json.append("\"limit\":").append(limit).append(",");
+        json.append("\"total\":").append(items.size()).append(",");
+        json.append("\"has_more\":").append(end < items.size());
+        json.append("}");
+        
+        return json.toString();
+    }
+    
+    /**
+     * Escape special characters in JSON strings
+     */
+    private String escapeJsonString(String str) {
+        if (str == null) return "";
+        return str.replace("\\", "\\\\")
+                  .replace("\"", "\\\"")
+                  .replace("\n", "\\n")
+                  .replace("\r", "\\r")
+                  .replace("\t", "\\t");
+    }
+    
+    /**
+     * Format a list as JSON array
+     */
+    private String formatListAsJson(List<?> list) {
+        StringBuilder json = new StringBuilder();
+        json.append("[");
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) json.append(",");
+            Object item = list.get(i);
+            if (item instanceof Map) {
+                json.append(formatMapAsJson((Map<?, ?>) item));
+            } else {
+                json.append("\"").append(escapeJsonString(String.valueOf(item))).append("\"");
+            }
+        }
+        json.append("]");
+        return json.toString();
+    }
+    
+    /**
+     * Format a map as JSON object
+     */
+    private String formatMapAsJson(Map<?, ?> map) {
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        boolean first = true;
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (!first) json.append(",");
+            first = false;
+            json.append("\"").append(String.valueOf(entry.getKey())).append("\":");
+            json.append("\"").append(escapeJsonString(String.valueOf(entry.getValue()))).append("\"");
+        }
+        json.append("}");
+        return json.toString();
     }
 
     /**
