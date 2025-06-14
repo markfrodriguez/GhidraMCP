@@ -178,7 +178,58 @@ def list_functions() -> list:
 @mcp.tool()
 def decompile_function_by_address(address: str) -> str:
     """
-    Decompile a function at the given address.
+    Decompile function code at specific address for detailed analysis.
+    
+    KEYWORDS: decompile, disassemble, function analysis, code analysis, address analysis
+    ALIASES: analyze function, decompile address, function code, show code at address
+    
+    REVERSE ENGINEERING WORKFLOWS:
+    
+    🔧 QEMU PC Analysis:
+    - When QEMU stops at address: Use this to understand what code is executing
+    - When exception occurs: Decompile handler function to understand expected behavior
+    - When code is stuck: Analyze function logic to determine why execution stopped
+    
+    🔍 Critical Debugging Scenarios:
+    - "QEMU PC = 0x00001234, what is this code doing?" → decompile_function_by_address("0x00001234")
+    - "Exception at handler address" → Decompile to understand handler expectations
+    - "Code stuck in polling loop" → Analyze loop conditions and exit criteria
+    - "Interrupt handler analysis" → Understand what interrupt handler should do
+    
+    📊 Analysis Output:
+    - High-level C-like pseudocode for easier understanding
+    - Variable and parameter identification
+    - Control flow analysis (loops, conditionals, function calls)
+    - Memory access patterns and register operations
+    
+    Args:
+        address: Memory address of function to decompile (e.g., "0x00001234")
+                Format: Hex address with or without 0x prefix
+                Sources: QEMU PC, handler_address from list_interrupts(), instruction_address from list_comments()
+    
+    Returns:
+        Decompiled C-like code showing:
+        - Function structure and logic flow
+        - Variable assignments and operations  
+        - Conditional branches and loops
+        - Function calls and memory access
+        - Register and peripheral interactions
+    
+    INTEGRATION WITH QEMU ANALYSIS:
+    - Use QEMU PC value directly as address parameter
+    - Understand why QEMU execution stopped or failed
+    - Identify what conditions code is waiting for
+    - Determine what memory/peripheral access should succeed
+    
+    WORKFLOW INTEGRATION:
+    - Follow up with xrefs_to(address) to see what calls this function
+    - Use list_comments(filter="address") to understand peripheral context
+    - Cross-reference with list_interrupts() for interrupt handler analysis
+    
+    RELATED FUNCTIONS:
+        - get_function_xrefs(name="function_name") → See what references this function
+        - xrefs_to(address="0x1234") → Find all references to specific addresses
+        - list_comments(filter="0x40001000") → Understand memory-mapped register access
     """
     return "\n".join(safe_get("decompile_function", {"address": address}))
 
@@ -288,56 +339,151 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
     return safe_get("strings", params)
 
 @mcp.tool()
-def list_interrupts(offset: int = 0, limit: int = 100) -> list:
+def list_interrupts(offset: int = 0, limit: int = 100) -> dict:
     """
-    List all interrupts used in the program through comprehensive analysis.
+    Analyze and list active interrupts in ARM Cortex-M firmware.
     
-    This analyzes multiple sources to identify interrupts:
-    1. ARM Cortex-M vector table analysis
-    2. NVIC register operations (interrupt enable/disable)
-    3. Interrupt handler function identification
+    KEYWORDS: interrupts, IRQ, vector, handler, exception, peripheral interrupts, NVIC
+    ALIASES: show interrupts, get IRQs, interrupt handlers, vector table, exceptions
+    
+    REVERSE ENGINEERING WORKFLOWS:
+    
+    🔧 QEMU Exception Analysis:
+    - When QEMU hits exception: Use this to find expected interrupt handlers
+    - When code is stuck waiting: Check what interrupts should trigger
+    - When polling detected: Identify which IRQ might advance execution
+    
+    🔍 Debugging Scenarios:
+    - "Code stuck, what interrupt is it waiting for?" → Check enabled interrupts
+    - "Exception at handler, which IRQ triggered?" → Match handler address to IRQ
+    - "Need to advance execution" → Trigger specific IRQ in QEMU
+    
+    📊 Analysis Sources:
+    - ARM Cortex-M vector table (system exceptions + external IRQs)
+    - Unique interrupt handler functions (filters out default handlers)
+    - SVD comments with interrupt enable/disable operations
+    - NVIC register analysis for explicit interrupt configuration
+    
+    Returns ONLY active interrupts:
+    - System exceptions (Reset, NMI, HardFault, etc.)
+    - External interrupts with dedicated handler functions
     
     Args:
-        offset: Pagination offset (default: 0)
-        limit: Maximum number of interrupts to return (default: 100)
+        offset: Pagination offset for large interrupt lists (default: 0)
+        limit: Maximum interrupts to return (default: 100)
         
     Returns:
-        List of interrupts with detailed information including:
-        - IRQ number and name
-        - Handler addresses and function names
-        - Enable status from NVIC operations
-        - Vector table information
+        JSON with structured interrupt data:
+        {
+          "results": [
+            {
+              "irq_number": 27,              # Use to trigger in QEMU: "IRQ_27"
+              "name": "EIC_INTREQ_15",       # Specific peripheral interrupt name
+              "vector": 27,                  # Vector table position
+              "handler_address": "0x196C",   # Match against QEMU PC for analysis
+              "handler_function": "eic_handler", # Function name for cross-reference
+              "peripheral": "EIC",           # Peripheral that generates this IRQ
+              "confidence": "high",          # Reliability of detection
+              "enabled": true                # Whether interrupt is enabled
+            }
+          ]
+        }
+    
+    INTEGRATION WITH QEMU ANALYSIS:
+    - Match QEMU PC against handler_address to identify triggered interrupt
+    - Use irq_number to send interrupt trigger commands to QEMU
+    - Cross-reference peripheral name with register access for root cause analysis
+    
+    RELATED FUNCTIONS:
+        - list_segments() → Find peripheral memory regions for interrupt sources
+        - list_comments(peripheral="EIC") → Understand interrupt configuration details
+        - get_function_xrefs(name="eic_handler") → Analyze interrupt handler code
+        - decompile_function(address="0x196C") → Understand handler implementation
     """
     return safe_get("interrupts", {"offset": offset, "limit": limit})
 
 @mcp.tool()
-def list_comments(offset: int = 0, limit: int = 1000, filter: str = None, peripheral: str = None) -> list:
+def list_comments(offset: int = 0, limit: int = 1000, filter: str = None, peripheral: str = None) -> dict:
     """
-    List all SVD comments in the program with their memory addresses.
+    Analyze SVD comments showing detailed peripheral register access patterns.
     
-    SVD comments provide detailed peripheral register information including:
-    - Peripheral and register names
-    - Register descriptions and field details
-    - Configured values and operations
-    - Interrupt context information
+    KEYWORDS: comments, SVD, registers, peripheral config, register access, memory mapped
+    ALIASES: show registers, peripheral analysis, register operations, memory access
+    
+    REVERSE ENGINEERING WORKFLOWS:
+    
+    🔧 QEMU Memory Access Analysis:
+    - When QEMU shows invalid memory access: Check if address maps to peripheral register
+    - When code polls memory location: Understand what register/peripheral it's waiting on
+    - When interrupt fails to trigger: Analyze peripheral configuration for proper setup
+    
+    🔍 Debugging Scenarios:
+    - "Code stuck polling 0x40001000" → list_comments(filter="0x40001000")
+    - "UART not working" → list_comments(peripheral="UART") 
+    - "Interrupt not triggering" → list_comments(filter="INTENSET")
+    - "What's configured for EIC?" → list_comments(peripheral="EIC")
+    
+    📊 Analysis Capabilities:
+    - Peripheral register read/write operations with exact values
+    - Bit field configurations and their meanings
+    - Interrupt enable/disable operations
+    - Register access patterns and sequences
+    - Memory-mapped peripheral identification
+    
+    WORKFLOW INTEGRATION:
+    1. Use list_segments() to identify peripheral memory regions
+    2. Use list_comments(peripheral="NAME") for detailed register analysis  
+    3. Use list_interrupts() to correlate with interrupt configuration
+    4. Apply findings to configure QEMU peripheral state
     
     Args:
-        offset: Pagination offset (default: 0)
-        limit: Maximum number of comments to return (default: 1000)
-        filter: Optional filter to match within comment content
-        peripheral: Optional peripheral name to filter by (e.g., "EIC", "RTC", "DMAC")
-                   If provided, returns only comments for that peripheral.
-                   If not provided or no comments found, returns all comments.
+        offset: Pagination offset for large comment sets (default: 0)
+        limit: Maximum comments to return (default: 1000)
+        filter: Text search within comment content
+                Examples: "0x40001000", "INTENSET", "WRITE:0x8000"
+        peripheral: Filter by peripheral name (get names from list_segments())
+                   Examples: "EIC", "RTC", "DMAC", "UART", "SPI"
         
     Returns:
-        List of SVD comments with their addresses and parsed information:
-        - instruction_address: Memory address of the instruction where comment is located
-        - comment: Full SVD comment text
-        - peripheral: Peripheral name (e.g., "EIC", "RTC", "DMAC")
-        - register: Register name (e.g., "CTRLA", "INTENSET")
-        - operation: Operation type (read, WRITE:0xVALUE)
-        - fields: Parsed field information
-        - interrupts: Associated interrupt context
+        JSON with detailed register access information:
+        {
+          "results": [
+            {
+              "instruction_address": "0x00001234",  # Code location for this register access
+              "peripheral": "EIC",                  # Peripheral name (matches list_segments)
+              "register": "INTENSET",               # Specific register name
+              "operation": "WRITE:0x8000",          # Read/Write with value
+              "fields": [                           # Bit field breakdown
+                {
+                  "name": "EXTINT",
+                  "offset": "15", 
+                  "width": "1",
+                  "value": "0x1",
+                  "description": "External Interrupt 15 Enable"
+                }
+              ],
+              "interrupts": [                       # Related interrupt information
+                {
+                  "action": "ENABLE",
+                  "name": "EIC_INTREQ_15", 
+                  "vector": "27"
+                }
+              ]
+            }
+          ]
+        }
+    
+    INTEGRATION WITH QEMU ANALYSIS:
+    - Match instruction_address against QEMU PC to understand current operation
+    - Use peripheral/register info to set proper QEMU peripheral state
+    - Apply field configurations to simulate realistic peripheral behavior
+    - Use interrupt info to determine when to trigger interrupts in QEMU
+    
+    RELATED FUNCTIONS:
+        - list_segments() → Get peripheral names and memory regions
+        - list_interrupts() → See interrupts related to peripheral configuration
+        - xrefs_to(address="0x40001000") → Find all code that accesses specific registers
+        - decompile_function() → Understand register access context within functions
     """
     params = {"offset": offset, "limit": limit}
     if filter:
@@ -349,16 +495,52 @@ def list_comments(offset: int = 0, limit: int = 1000, filter: str = None, periph
 @mcp.tool()
 def get_main_function() -> dict:
     """
-    Get the main function entry point identified from reset vector analysis.
+    Find the firmware's main entry point from reset vector analysis.
     
-    Searches for the special SVD comment that marks the firmware's main function:
-    "SVD: Main entry point - Application start (auto-identified from reset vector analysis)"
+    KEYWORDS: main, entry point, reset vector, startup, firmware entry, program start
+    ALIASES: find main, entry point, reset handler, startup function, program entry
+    
+    REVERSE ENGINEERING WORKFLOWS:
+    
+    🔧 QEMU Startup Analysis:
+    - When QEMU execution begins: Use this to find where main program logic starts
+    - When analyzing firmware flow: Identify the primary entry point after reset
+    - When debugging initialization: Find the start of application code
+    
+    🔍 Debugging Scenarios:
+    - "Where does the program start?" → Use this to get main entry point
+    - "QEMU reset, where should execution begin?" → Get reset vector target
+    - "Need to set QEMU PC for main analysis" → Use instruction_address
+    
+    📊 Analysis Method:
+    - Searches for special SVD comment marking main function
+    - Identified through ARM Cortex-M reset vector analysis
+    - Points to actual application start (not just reset handler)
     
     Returns:
-        Dictionary containing:
-        - found: Boolean indicating if main function was found
-        - instruction_address: Memory address of the main function entry point (or None if not found)
-        - comment: The full SVD comment text if found (or None if not found)
+        JSON with main function details:
+        {
+          "found": true,
+          "instruction_address": "0x00000F04",     # Set QEMU PC here for main analysis
+          "comment": "SVD: Main entry point - Application start..."
+        }
+        
+        Or if not found:
+        {
+          "found": false,
+          "instruction_address": null,
+          "comment": null
+        }
+    
+    INTEGRATION WITH QEMU ANALYSIS:
+    - Use instruction_address to set QEMU PC for main program analysis
+    - Start dynamic analysis from this point after reset
+    - Compare against QEMU reset vector execution path
+    
+    RELATED FUNCTIONS:
+        - decompile_function(address=instruction_address) → Analyze main function code
+        - get_function_xrefs(name="main") → See what calls or references main
+        - list_interrupts() → Understand interrupt setup in main initialization
     """
     return safe_get("main_function", {})
 
