@@ -1563,12 +1563,12 @@ public class GhidraMCPPlugin extends Plugin {
             List<InterruptInfo> interrupts = analyzeInterrupts(program);
             
             // Apply pagination
-            List<String> formattedResults = new ArrayList<>();
+            List<Map<String, Object>> formattedResults = new ArrayList<>();
             for (InterruptInfo interrupt : interrupts) {
-                formattedResults.add(formatInterruptInfo(interrupt));
+                formattedResults.add(formatInterruptAsJson(interrupt));
             }
             
-            return paginateList(formattedResults, offset, limit);
+            return formatCommentsAsJson(formattedResults, offset, limit);
         } catch (Exception e) {
             return "Error analyzing interrupts: " + e.getMessage();
         }
@@ -1909,7 +1909,86 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
-     * Format interrupt information for display
+     * Format interrupt information as JSON object
+     */
+    private Map<String, Object> formatInterruptAsJson(InterruptInfo interrupt) {
+        Map<String, Object> json = new HashMap<>();
+        
+        // Basic interrupt information
+        json.put("irq_number", interrupt.irqNumber);
+        json.put("name", interrupt.name);
+        json.put("type", interrupt.type);
+        json.put("vector", interrupt.irqNumber);
+        
+        // Confidence and reason
+        json.put("confidence", interrupt.confidence);
+        json.put("reason", interrupt.reason);
+        
+        // Handler information
+        if (interrupt.handlerAddress != 0) {
+            json.put("handler_address", String.format("0x%08X", interrupt.handlerAddress));
+        } else {
+            json.put("handler_address", null);
+        }
+        
+        if (interrupt.handlerFunctionName != null) {
+            json.put("handler_function", interrupt.handlerFunctionName);
+        } else {
+            json.put("handler_function", null);
+        }
+        
+        // Vector table information
+        if (interrupt.vectorTableOffset != -1) {
+            json.put("vector_table_offset", String.format("0x%02X", interrupt.vectorTableOffset));
+        } else {
+            json.put("vector_table_offset", null);
+        }
+        
+        // Peripheral information
+        json.put("peripheral", interrupt.peripheralName);
+        json.put("register", interrupt.registerName);
+        json.put("interrupt_source", interrupt.interruptSource);
+        
+        // SVD information
+        json.put("description", interrupt.svdDescription);
+        json.put("trigger_type", interrupt.triggerType);
+        json.put("configured_value", interrupt.configuredValue);
+        
+        // Status information
+        json.put("enabled", interrupt.enabled);
+        json.put("has_peripheral_config", interrupt.hasPeripheralConfig);
+        json.put("has_comment_info", interrupt.hasCommentInfo);
+        
+        // Configuration details
+        if (interrupt.peripheralConfigAddress != 0) {
+            json.put("config_address", String.format("0x%08X", interrupt.peripheralConfigAddress));
+        } else {
+            json.put("config_address", null);
+        }
+        
+        // Bit field configuration
+        json.put("bit_fields", interrupt.bitFieldConfig);
+        
+        // NVIC operations
+        if (!interrupt.nvicOperations.isEmpty()) {
+            List<Map<String, Object>> nvicOps = new ArrayList<>();
+            for (NVICOperation op : interrupt.nvicOperations) {
+                Map<String, Object> nvicOp = new HashMap<>();
+                nvicOp.put("operation", op.operation);
+                nvicOp.put("address", String.format("0x%08X", op.address));
+                nvicOp.put("value", String.format("0x%X", op.value));
+                nvicOps.add(nvicOp);
+            }
+            json.put("nvic_operations", nvicOps);
+        } else {
+            json.put("nvic_operations", new ArrayList<>());
+        }
+        
+        return json;
+    }
+
+    /**
+     * Legacy format interrupt information for display (kept for reference)
      */
     private String formatInterruptInfo(InterruptInfo interrupt) {
         StringBuilder sb = new StringBuilder();
